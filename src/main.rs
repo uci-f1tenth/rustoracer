@@ -11,9 +11,9 @@ use crate::sim::Sim;
 #[cfg(not(feature = "ros"))]
 #[cfg_attr(feature = "show_images", show_image::main)]
 fn main() {
-    let mut sim = Sim::new("maps/berlin.yaml", 1, 10_000);
+    let mut sim = Sim::new("maps/skirk.yaml", 1, 10_000);
     sim.reset(&[[0.0, 0.0, 0.0]]);
-    for _ in 0..100_000 {
+    for _ in 0..1_000_000 {
         let _obs = sim.step(&[0.0, 1.0]);
     }
 }

@@ -1,5 +1,5 @@
 use crate::car::{Car, LENGTH, WIDTH};
-use crate::skeleton::thin_image_edges;
+use crate::skeleton::{extract_main_loop, thin_image_edges};
 use image::GrayImage;
 use imageproc::distance_transform::euclidean_squared_distance_transform;
 use kiddo::SquaredEuclidean;
@@ -19,9 +19,7 @@ pub struct OccGrid {
     inv_res: f64,
     pub img: GrayImage,
     pub edt: Vec<f64>,
-    pub skeleton: GrayImage,
     pub ordered_skeleton: Vec<[f64; 2]>,
-    pub skeleton_tree: ImmutableKdTree<f64, usize, 2, 32>,
     pub skeleton_lut: Vec<usize>,
     pub res: f64,
     pub ox: f64,
@@ -45,80 +43,43 @@ impl OccGrid {
             pixel.0[0] = if pixel.0[0] < 128 { 255 } else { 0 };
         }
         let edt = euclidean_squared_distance_transform(&occupied_image);
-        let skeleton = thin_image_edges(&occupied_image);
+        let mut skeleton = thin_image_edges(&occupied_image);
+        let ordered_skeleton =
+            extract_main_loop(&mut skeleton, m.resolution, m.origin[0], m.origin[1]);
         #[cfg(feature = "show_images")]
         view_image(&occupied_image, "occupied");
         #[cfg(feature = "show_images")]
         view_image(&skeleton, "skeleton");
-        let mut map = Self {
+        let skeleton_tree = ImmutableKdTree::new_from_slice(&ordered_skeleton);
+        let (w, h) = (img.width(), img.height());
+        let skeleton_lut =
+            Self::build_skeleton_lut(&skeleton_tree, w, h, m.resolution, m.origin[0], m.origin[1]);
+        Self {
             inv_res: 1.0 / m.resolution,
             img,
             edt: edt.pixels().map(|p| p.0[0].sqrt() * m.resolution).collect(),
-            skeleton,
-            ordered_skeleton: Vec::new(),
-            skeleton_tree: ImmutableKdTree::new_from_slice(&[]),
-            skeleton_lut: Vec::new(),
+            ordered_skeleton,
+            skeleton_lut,
             res: m.resolution,
             ox: m.origin[0],
             oy: m.origin[1],
-        };
-        map.ordered_skeleton = map.ordered_skeleton();
-        map.skeleton_tree = ImmutableKdTree::new_from_slice(&map.ordered_skeleton);
-        map.skeleton_lut = map.build_skeleton_lut();
-        map
+        }
     }
 
-    pub fn ordered_skeleton(&self) -> Vec<[f64; 2]> {
-        let mut pts: Vec<[f64; 2]> = self
-            .skeleton
-            .enumerate_pixels()
-            .filter(|(_, _, p)| p.0[0] != 255)
-            .map(|(px, py, _)| {
-                let (x, y) = self.pixels_to_position(px, py);
-                [x, y]
-            })
-            .collect();
-        if pts.is_empty() {
-            return pts;
-        }
-        let mut ordered = Vec::with_capacity(pts.len());
-        let first = pts
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                let da = a[0].powi(2) + a[1].powi(2);
-                let db = b[0].powi(2) + b[1].powi(2);
-                da.partial_cmp(&db).unwrap()
-            })
-            .unwrap()
-            .0;
-        ordered.push(pts.swap_remove(first));
-        while !pts.is_empty() {
-            let last = *ordered.last().unwrap();
-            let nearest = pts
-                .iter()
-                .enumerate()
-                .min_by(|(_, a), (_, b)| {
-                    let da = (a[0] - last[0]).powi(2) + (a[1] - last[1]).powi(2);
-                    let db = (b[0] - last[0]).powi(2) + (b[1] - last[1]).powi(2);
-                    da.partial_cmp(&db).unwrap()
-                })
-                .unwrap()
-                .0;
-            ordered.push(pts.swap_remove(nearest));
-        }
-        ordered
-    }
-
-    fn build_skeleton_lut(&self) -> Vec<usize> {
-        let (w, h) = (self.img.width(), self.img.height());
+    fn build_skeleton_lut(
+        tree: &ImmutableKdTree<f64, usize, 2, 32>,
+        w: u32,
+        h: u32,
+        res: f64,
+        ox: f64,
+        oy: f64,
+    ) -> Vec<usize> {
         (0..h)
             .flat_map(|py| {
                 (0..w).map(move |px| {
-                    let (x, y) = self.pixels_to_position(px, py);
-                    self.skeleton_tree
-                        .nearest_one::<SquaredEuclidean>(&[x, y])
-                        .item
+                    let x = px as f64 * res + ox;
+                    let y = (h - 1 - py) as f64 * res + oy;
+                    tree.nearest_one::<SquaredEuclidean>(&[x, y]).item
                 })
             })
             .collect()
@@ -127,13 +88,6 @@ impl OccGrid {
     pub fn skeleton_idx(&self, x: f64, y: f64) -> usize {
         let (px, py) = self.position_to_pixels(x, y);
         self.skeleton_lut[(py * self.img.width() + px) as usize]
-    }
-
-    #[inline]
-    pub fn pixels_to_position(&self, px: u32, py: u32) -> (f64, f64) {
-        let x = px as f64 * self.res + self.ox;
-        let y = (self.img.height() - 1 - py) as f64 * self.res + self.oy;
-        (x, y)
     }
 
     #[inline]

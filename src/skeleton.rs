@@ -1,3 +1,6 @@
+use image::{GrayImage, Luma};
+use std::collections::{HashMap, HashSet, VecDeque};
+
 const BACKGROUND_COLOR: u8 = 255;
 
 /// Classification of pixels in an image used for edge thinning.
@@ -11,8 +14,6 @@ pub enum Edge {
     /// The pixel is not a valid location within the image.
     DoesNotExist,
 }
-
-use image::Luma;
 
 /// Struct with information describing the surrounding pixels.
 pub struct NeighborInfo {
@@ -212,4 +213,94 @@ pub fn thin_image_edges(img_in: &image::GrayImage) -> image::GrayImage {
 
         pixels_to_remove.clear();
     }
+}
+
+fn neighbors(fg: &HashSet<(u32, u32)>, x: u32, y: u32) -> Vec<(u32, u32)> {
+    [
+        (1, 1),
+        (1, 0),
+        (1, -1),
+        (0, 1),
+        (0, -1),
+        (-1, 1),
+        (-1, 0),
+        (-1, -1),
+    ]
+    .iter()
+    .filter_map(|&(dx, dy)| {
+        let n = ((x as i32 + dx) as u32, (y as i32 + dy) as u32);
+        fg.contains(&n).then_some(n)
+    })
+    .collect()
+}
+
+pub fn extract_main_loop(img: &mut GrayImage, res: f64, ox: f64, oy: f64) -> Vec<[f64; 2]> {
+    let fg: HashSet<(u32, u32)> = img
+        .enumerate_pixels()
+        .filter(|(_, _, p)| p.0[0] != BACKGROUND_COLOR)
+        .map(|(x, y, _)| (x, y))
+        .collect();
+
+    let (cx, cy) = (img.width() / 2, img.height() / 2);
+    let start = match fg
+        .iter()
+        .copied()
+        .min_by_key(|&(x, y)| (x as i64 - cx as i64).pow(2) + (y as i64 - cy as i64).pow(2))
+    {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    let nbrs = neighbors(&fg, start.0, start.1);
+    if nbrs.len() < 2 {
+        return Vec::new();
+    }
+
+    let src = nbrs[0];
+    let targets: HashSet<_> = nbrs[1..].iter().copied().collect();
+    let mut parent: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
+    parent.insert(src, src);
+    let mut q = VecDeque::from([src]);
+    let mut found = None;
+
+    while let Some(cur) = q.pop_front() {
+        for n in neighbors(&fg, cur.0, cur.1) {
+            if n == start || parent.contains_key(&n) {
+                continue;
+            }
+            parent.insert(n, cur);
+            if targets.contains(&n) {
+                found = Some(n);
+                break;
+            }
+            q.push_back(n);
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+
+    let mut pixels = vec![start];
+    if let Some(end) = found {
+        let mut p = end;
+        while p != src {
+            pixels.push(p);
+            p = parent[&p];
+        }
+        pixels.push(src);
+    }
+    pixels.reverse();
+
+    let keep: HashSet<_> = pixels.iter().copied().collect();
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        if p.0[0] != BACKGROUND_COLOR && !keep.contains(&(x, y)) {
+            *p = Luma([BACKGROUND_COLOR]);
+        }
+    }
+
+    let h = img.height();
+    pixels
+        .iter()
+        .map(|&(px, py)| [px as f64 * res + ox, (h - 1 - py) as f64 * res + oy])
+        .collect()
 }
