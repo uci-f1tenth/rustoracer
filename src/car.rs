@@ -161,3 +161,359 @@ impl Car {
         self.slip_angle = slip;
     }
 }
+
+#[cfg(test)]
+mod dynamics_tests {
+    use super::*;
+
+    /// Integrate the raw dynamics (no PID, no constraint) over `[0, t_final)`
+    /// with a fixed step of `dt` using the crate's own RK4 integrator.
+    #[allow(dead_code)]
+    fn integrate_raw(initial: State, a: f64, sv: f64, dt: f64, t_final: f64) -> State {
+        let steps = (t_final / dt).round() as usize;
+        let mut s = initial;
+        for _ in 0..steps {
+            s = rk4(&s, dt, |st| dynamics(st, a, sv));
+        }
+        s
+    }
+
+    /// Integrate using constrained inputs (matches what `Car::step` does
+    /// minus the PID layer) so we can feed exact accel / steer-velocity.
+    fn integrate_constrained(initial: State, a: f64, sv: f64, dt: f64, t_final: f64) -> State {
+        let steps = (t_final / dt).round() as usize;
+        let mut s = initial;
+        for _ in 0..steps {
+            let ca = accel_constraint(s[3], a);
+            let csv = steering_constraint(s[2], sv);
+            s = rk4(&s, dt, |st| dynamics(st, ca, csv));
+            s[2] = s[2].clamp(STEER_MIN, STEER_MAX);
+            s[3] = s[3].clamp(V_MIN, V_MAX);
+        }
+        s
+    }
+
+    fn assert_state_near(got: &State, expected: &State, tol: f64, label: &str) {
+        for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < tol,
+                "{label}: state[{i}] mismatch: got {g:.10}, expected {e:.10} (tol {tol})"
+            );
+        }
+    }
+
+    // ── 1. Derivative / dynamics sanity checks ──────────────────────────
+
+    #[test]
+    fn test_kinematic_derivatives_zero_state() {
+        // At zero state with zero input the kinematic model must return all zeros.
+        let s: State = [0.0; 7];
+        let f = kinematic_dynamics(&s, 0.0, 0.0);
+        for (i, &v) in f.iter().enumerate() {
+            assert!(
+                v.abs() < 1e-12,
+                "kinematic_dynamics: f[{i}] should be 0, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dynamic_switch_threshold() {
+        // Below the kinematic/dynamic switch boundary the `dynamics`
+        // dispatcher must choose the kinematic model.
+        let s: State = [0.0, 0.0, 0.0, V_KIN_THRESHOLD * 0.99, 0.0, 0.0, 0.0];
+        let f_dispatch = dynamics(&s, 0.0, 0.0);
+        let f_kin = kinematic_dynamics(&s, 0.0, 0.0);
+        assert_eq!(
+            f_dispatch, f_kin,
+            "Should use kinematic model below threshold"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_model_above_threshold() {
+        // Above the threshold the dynamic model must be used.
+        let s: State = [0.0, 0.0, 0.1, 5.0, 0.0, 0.0, 0.0];
+        let f_dispatch = dynamics(&s, 1.0, 0.0);
+        let f_dyn = dynamic_dynamics(&s, 1.0, 0.0);
+        assert_eq!(
+            f_dispatch, f_dyn,
+            "Should use dynamic model above threshold"
+        );
+    }
+
+    #[test]
+    fn test_kinematic_straight_line() {
+        // Driving straight (steer=0, slip=0) at vx=5 m/s, yaw=0:
+        // ẋ = vx, ẏ = 0, rest governed by inputs.
+        let s: State = [0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0];
+        let f = kinematic_dynamics(&s, 1.0, 0.0);
+        assert!((f[0] - 5.0).abs() < 1e-10, "ẋ should equal vx");
+        assert!(f[1].abs() < 1e-10, "ẏ should be 0 for straight line");
+        assert!(
+            (f[3] - 1.0).abs() < 1e-10,
+            "v̇x should equal acceleration input"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_derivatives_known_state() {
+        // Evaluate the dynamic model at a known operating point and verify
+        // key structural properties.
+        let steer = 0.05;
+        let vx = 8.0;
+        let yaw = 0.1;
+        let yr = 0.1;
+        let slip = 0.02;
+        let s: State = [1.0, 0.5, steer, vx, yaw, yr, slip];
+        let a = 2.0;
+        let sv = 0.1;
+        let f = dynamic_dynamics(&s, a, sv);
+
+        // ẋ = vx * cos(slip + yaw)
+        let expected_xdot = vx * (slip + yaw).cos();
+        assert!(
+            (f[0] - expected_xdot).abs() < 1e-10,
+            "ẋ mismatch: got {}, expected {}",
+            f[0],
+            expected_xdot
+        );
+        // ẏ = vx * sin(slip + yaw)
+        let expected_ydot = vx * (slip + yaw).sin();
+        assert!(
+            (f[1] - expected_ydot).abs() < 1e-10,
+            "ẏ mismatch: got {}, expected {}",
+            f[1],
+            expected_ydot
+        );
+        // δ̇ = sv, v̇x = a, ψ̇ = yr
+        assert!((f[2] - sv).abs() < 1e-12);
+        assert!((f[3] - a).abs() < 1e-12);
+        assert!((f[4] - yr).abs() < 1e-12);
+    }
+
+    // ── 2. Constraint functions ─────────────────────────────────────────
+
+    #[test]
+    fn test_steering_constraint_limits() {
+        // At minimum steering angle, negative velocity is clamped to 0.
+        assert_eq!(steering_constraint(STEER_MIN, -1.0), 0.0);
+        // At maximum steering angle, positive velocity is clamped to 0.
+        assert_eq!(steering_constraint(STEER_MAX, 1.0), 0.0);
+        // Within range, velocity is just clamped to [sv_min, sv_max].
+        assert_eq!(steering_constraint(0.0, 100.0), STEER_VEL_MAX);
+        assert_eq!(steering_constraint(0.0, -100.0), STEER_VEL_MIN);
+    }
+
+    #[test]
+    fn test_accel_constraint_limits() {
+        // At V_MIN, negative accel is zeroed.
+        assert_eq!(accel_constraint(V_MIN, -5.0), 0.0);
+        // At V_MAX, positive accel is zeroed.
+        assert_eq!(accel_constraint(V_MAX, 5.0), 0.0);
+        // Above V_SWITCH the positive limit drops.
+        let vel = V_SWITCH * 2.0;
+        let limited = accel_constraint(vel, 100.0);
+        let expected = A_MAX * V_SWITCH / vel;
+        assert!((limited - expected).abs() < 1e-10);
+        // Negative accel clamps to -A_MAX.
+        assert!((accel_constraint(5.0, -100.0) - (-A_MAX)).abs() < 1e-10);
+    }
+
+    // ── 3. Zero-init integration tests (adapted from Python suite) ──────
+
+    const DT: f64 = 1e-4;
+    const T_FINAL: f64 = 1.0;
+
+    #[test]
+    fn test_zeroinit_roll() {
+        // Zero state, zero input → state must stay at zero.
+        let s0: State = [0.0; 7];
+        let s = integrate_constrained(s0, 0.0, 0.0, DT, T_FINAL);
+        assert_state_near(&s, &s0, 1e-8, "zeroinit_roll");
+    }
+
+    #[test]
+    fn test_zeroinit_decel() {
+        // Zero state, strong braking input.
+        // Note: V_MIN = −5.0 in rustoracer (vs −13.6 in f1tenth_gym), so
+        // the velocity saturates at −5.0 before the unclamped value of
+        // −6.867 would be reached.
+        //
+        // Phase 1 (constant accel a = −6.867):
+        //   v(t) = a·t  →  hits V_MIN at t_sat = |V_MIN / a| ≈ 0.7282 s
+        //   x at t_sat = ½·a·t_sat² ≈ −1.8209
+        // Phase 2 (accel clamped to 0, constant v = V_MIN):
+        //   remaining time = 1.0 − t_sat ≈ 0.2718 s
+        //   Δx = V_MIN · remaining ≈ −1.3590
+        // Total x ≈ −3.18
+        let s0: State = [0.0; 7];
+        let a = -0.7 * G; // ≈ −6.867 m/s²
+        let sv = 0.0;
+        let s = integrate_constrained(s0, a, sv, DT, T_FINAL);
+
+        // Velocity should saturate at V_MIN.
+        assert!(
+            (s[3] - V_MIN).abs() < 0.05,
+            "velocity should saturate at V_MIN = {V_MIN}, got {}",
+            s[3]
+        );
+        // Car should have moved in −x.
+        let t_sat = V_MIN.abs() / a.abs();
+        let x_phase1 = 0.5 * a * t_sat * t_sat;
+        let x_phase2 = V_MIN * (T_FINAL - t_sat);
+        let expected_x = x_phase1 + x_phase2;
+        assert!(
+            (s[0] - expected_x).abs() < 0.1,
+            "x mismatch: got {}, expected {expected_x}",
+            s[0]
+        );
+        // Lateral state stays near zero.
+        assert!(s[1].abs() < 1e-6, "y should stay ≈ 0");
+        assert!(s[4].abs() < 1e-6, "yaw should stay ≈ 0");
+        assert!(s[6].abs() < 1e-6, "slip should stay ≈ 0");
+    }
+
+    #[test]
+    fn test_zeroinit_accel_left_steer() {
+        // Zero state, accelerating + steering left.
+        let s0: State = [0.0; 7];
+        let a = 0.63 * G;
+        let sv = 0.15;
+        let s = integrate_constrained(s0, a, sv, DT, T_FINAL);
+
+        assert!(s[0] > 2.0, "should have moved forward in x, got {}", s[0]);
+        assert!(s[3] > 5.0, "should have positive velocity, got {}", s[3]);
+        assert!(
+            (s[2] - sv * T_FINAL).abs() < 0.01,
+            "steering angle should be ≈ sv*t = {}, got {}",
+            sv * T_FINAL,
+            s[2]
+        );
+        assert!(s[4] > 0.0, "yaw should be positive, got {}", s[4]);
+        assert!(s[1] > 0.0, "y should be positive, got {}", s[1]);
+    }
+
+    #[test]
+    fn test_zeroinit_roll_left_steer() {
+        // Zero state, zero accel, steering left.
+        // No velocity → no translation; only steering angle changes.
+        let s0: State = [0.0; 7];
+        let a = 0.0;
+        let sv = 0.15;
+        let s = integrate_constrained(s0, a, sv, DT, T_FINAL);
+
+        assert!(s[0].abs() < 1e-6, "x should stay ≈ 0, got {}", s[0]);
+        assert!(s[1].abs() < 1e-6, "y should stay ≈ 0, got {}", s[1]);
+        assert!(
+            (s[2] - sv * T_FINAL).abs() < 1e-4,
+            "steering should be ≈ 0.15, got {}",
+            s[2]
+        );
+        assert!(s[3].abs() < 1e-6, "velocity should stay ≈ 0, got {}", s[3]);
+        assert!(s[4].abs() < 1e-6, "yaw should stay ≈ 0, got {}", s[4]);
+    }
+
+    // ── 4. RK4 integrator sanity ────────────────────────────────────────
+
+    #[test]
+    fn test_rk4_constant_velocity() {
+        // Constant velocity, no inputs → pure translation.
+        let vx = 3.0;
+        let s0: State = [0.0, 0.0, 0.0, vx, 0.0, 0.0, 0.0];
+        let dt = 0.01;
+        let steps = 100; // 1 second
+        let mut s = s0;
+        for _ in 0..steps {
+            s = rk4(&s, dt, |st| dynamics(st, 0.0, 0.0));
+        }
+        assert!(
+            (s[0] - 3.0).abs() < 0.01,
+            "x after 1s should be ≈ 3.0, got {}",
+            s[0]
+        );
+        assert!(s[1].abs() < 0.01, "y should stay ≈ 0, got {}", s[1]);
+    }
+
+    // ── 5. PID + Car::step integration tests ────────────────────────────
+
+    #[test]
+    fn test_car_step_reaches_target_speed() {
+        let mut car = Car {
+            x: 0.0,
+            y: 0.0,
+            theta: 0.0,
+            velocity: 0.0,
+            steering: 0.0,
+            yaw_rate: 0.0,
+            slip_angle: 0.0,
+        };
+
+        let target_speed = 5.0;
+        let target_steer = 0.0;
+        let dt = 0.01;
+        for _ in 0..500 {
+            car.step(target_steer, target_speed, dt);
+        }
+
+        assert!(
+            (car.velocity - target_speed).abs() < 0.5,
+            "velocity should converge toward {target_speed}, got {}",
+            car.velocity
+        );
+        assert!(
+            car.x > 10.0,
+            "car should have moved forward significantly, got x={}",
+            car.x
+        );
+    }
+
+    #[test]
+    fn test_car_step_steers_left() {
+        let mut car = Car {
+            x: 0.0,
+            y: 0.0,
+            theta: 0.0,
+            velocity: 0.0,
+            steering: 0.0,
+            yaw_rate: 0.0,
+            slip_angle: 0.0,
+        };
+
+        let target_speed = 5.0;
+        let target_steer = 0.3;
+        let dt = 0.01;
+        for _ in 0..300 {
+            car.step(target_steer, target_speed, dt);
+        }
+
+        assert!(car.theta > 0.0, "yaw should be positive, got {}", car.theta);
+        assert!(car.y > 0.0, "y should be positive, got {}", car.y);
+        assert!(
+            (car.steering - target_steer).abs() < 0.05,
+            "steering should converge toward {target_steer}, got {}",
+            car.steering
+        );
+    }
+
+    // ── 6. Performance (mirrors Python fps assertion) ───────────────────
+
+    #[test]
+    fn test_dynamics_performance() {
+        use std::time::Instant;
+        let s: State = [1.0, 0.5, 0.05, 8.0, 0.1, 0.1, 0.02];
+        let iterations = 100_000;
+        let start = Instant::now();
+        let mut dummy = s;
+        for _ in 0..iterations {
+            dummy = dynamics(&dummy, 2.0, 0.1);
+            std::hint::black_box(&dummy);
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let fps = iterations as f64 / elapsed;
+        assert!(
+            fps > 100_000.0,
+            "dynamics eval rate too low: {fps:.0} evals/s"
+        );
+    }
+}
