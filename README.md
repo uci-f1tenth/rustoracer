@@ -1,11 +1,7 @@
 # Install instructions
 ### learnrl.py (new)
 ```bash
-uv run --with torch --with tensordict --with tqdm --with tyro --with wandb[media] learnrl.py
-```
-## ppo.py (old)
-```bash
-uv run --with torch ppo.py
+uv run scripts/learnrl.py
 ```
 
 ## Devcontainer
