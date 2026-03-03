@@ -167,36 +167,30 @@ pub fn thin_image_edges(img_in: &image::GrayImage) -> image::GrayImage {
 
             if phase_one {
                 if transitions == 1 {
-                    if (p2 == Edge::Empty || p4 == Edge::Empty || p6 == Edge::Empty)
-                        && (p4 == Edge::Empty || p6 == Edge::Empty || p8 == Edge::Empty)
+                    if p4 == Edge::Empty
+                        || p6 == Edge::Empty
+                        || p2 == Edge::Empty && p8 == Edge::Empty
                     {
                         pixels_to_remove.push((x, y));
                     }
-                } else {
-                    if ((p2 == Edge::Filled && p4 == Edge::Filled)
-                        && (p6 == Edge::Empty && p7 == Edge::Empty && p8 == Edge::Empty))
-                        || ((p4 == Edge::Filled && p6 == Edge::Filled)
-                            && (p2 == Edge::Empty && p8 == Edge::Empty && p9 == Edge::Empty))
-                    {
-                        pixels_to_remove.push((x, y));
-                    }
+                } else if ((p2 == Edge::Filled && p4 == Edge::Filled)
+                    && (p6 == Edge::Empty && p7 == Edge::Empty && p8 == Edge::Empty))
+                    || ((p4 == Edge::Filled && p6 == Edge::Filled)
+                        && (p2 == Edge::Empty && p8 == Edge::Empty && p9 == Edge::Empty))
+                {
+                    pixels_to_remove.push((x, y));
                 }
-            } else {
-                if transitions == 1 {
-                    if (p2 == Edge::Empty || p4 == Edge::Empty || p8 == Edge::Empty)
-                        && (p2 == Edge::Empty || p6 == Edge::Empty || p8 == Edge::Empty)
-                    {
-                        pixels_to_remove.push((x, y));
-                    }
-                } else {
-                    if ((p2 == Edge::Filled && p8 == Edge::Filled)
-                        && (p4 == Edge::Empty && p5 == Edge::Empty && p6 == Edge::Empty))
-                        || ((p6 == Edge::Filled && p8 == Edge::Filled)
-                            && (p2 == Edge::Empty && p3 == Edge::Empty && p4 == Edge::Empty))
-                    {
-                        pixels_to_remove.push((x, y));
-                    }
+            } else if transitions == 1 {
+                if p2 == Edge::Empty || p8 == Edge::Empty || p4 == Edge::Empty && p6 == Edge::Empty
+                {
+                    pixels_to_remove.push((x, y));
                 }
+            } else if ((p2 == Edge::Filled && p8 == Edge::Filled)
+                && (p4 == Edge::Empty && p5 == Edge::Empty && p6 == Edge::Empty))
+                || ((p6 == Edge::Filled && p8 == Edge::Filled)
+                    && (p2 == Edge::Empty && p3 == Edge::Empty && p4 == Edge::Empty))
+            {
+                pixels_to_remove.push((x, y));
             }
         }
 
