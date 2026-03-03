@@ -4,6 +4,7 @@ use image::GrayImage;
 use imageproc::distance_transform::euclidean_squared_distance_transform;
 use kiddo::SquaredEuclidean;
 use kiddo::immutable::float::kdtree::ImmutableKdTree;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::Deserialize;
 #[cfg(feature = "show_images")]
 use show_image::{ImageInfo, ImageView, create_window};
@@ -75,14 +76,22 @@ impl OccGrid {
         oy: f64,
     ) -> Vec<usize> {
         (0..h)
+            .into_par_iter()
             .flat_map(|py| {
-                (0..w).map(move |px| {
+                (0..w).into_par_iter().map(move |px| {
                     let x = px as f64 * res + ox;
                     let y = (h - 1 - py) as f64 * res + oy;
                     tree.nearest_one::<SquaredEuclidean>(&[x, y]).item
                 })
             })
             .collect()
+    }
+
+    pub fn skeleton_point(&self, idx: usize) -> (f64, f64, f64) {
+        let [px, py] = self.ordered_skeleton[idx];
+        let [nxt_px, nxt_py] = self.ordered_skeleton[(idx + 1) % self.ordered_skeleton.len()];
+        let theta = (nxt_py - py).atan2(nxt_px - px);
+        (px, py, theta)
     }
 
     pub fn skeleton_idx(&self, x: f64, y: f64) -> usize {

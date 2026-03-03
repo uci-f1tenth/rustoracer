@@ -3,7 +3,7 @@ use rand::{RngExt, SeedableRng};
 use rayon::prelude::*;
 use std::f64::consts::PI;
 
-use crate::car::Car;
+use crate::car::{Car, CarParams};
 use crate::map::OccGrid;
 
 pub struct Obs<'a> {
@@ -17,11 +17,12 @@ pub struct Obs<'a> {
 pub struct Sim {
     pub map: OccGrid,
     pub cars: Vec<Car>,
+    pub dr_frac: f64,
     pub dt: f64,
     pub n_beams: usize,
     pub fov: f64,
     pub max_range: f64,
-    pub rng: SmallRng,
+    pub rngs: Vec<SmallRng>,
     pub waypoint_idx: Vec<usize>,
     pub steps: Vec<u32>,
     pub max_steps: u32,
@@ -31,7 +32,6 @@ pub struct Sim {
     buf_rewards: Vec<f64>,
     buf_scans: Vec<f64>,
     buf_state: Vec<f64>,
-    buf_resets: Vec<usize>,
 }
 
 impl Sim {
@@ -42,25 +42,29 @@ impl Sim {
             .map(|i| -fov / 2.0 + fov * i as f64 / (n_beams - 1) as f64)
             .map(|a| a.sin_cos())
             .collect();
+        let map = OccGrid::load(yaml);
+        let (px, py, th) = map.skeleton_point(0);
         Self {
-            map: OccGrid::load(yaml),
+            map,
             cars: vec![
                 Car {
-                    x: 0.0,
-                    y: 0.0,
-                    theta: 0.0,
+                    x: px,
+                    y: py,
+                    theta: th,
                     velocity: 0.0,
                     steering: 0.0,
                     yaw_rate: 0.0,
                     slip_angle: 0.0,
+                    params: CarParams::default(),
                 };
                 n
             ],
+            dr_frac: 0.2,
             dt: 1.0 / 60.0,
             n_beams,
             fov,
             max_range: 30.0,
-            rng: SmallRng::seed_from_u64(0),
+            rngs: (0..n).map(|i| SmallRng::seed_from_u64(i as u64)).collect(),
             waypoint_idx: vec![0; n],
             steps: vec![0; n],
             max_steps,
@@ -70,25 +74,29 @@ impl Sim {
             buf_rewards: vec![0.0; n],
             buf_scans: vec![0.0; n * (n_beams + 2)],
             buf_state: vec![0.0; n * 7],
-            buf_resets: vec![0; n],
         }
     }
 
     pub fn seed(&mut self, seed: u64) {
-        self.rng = SmallRng::seed_from_u64(seed);
+        self.rngs = (0..self.rngs.len())
+            .map(|i| SmallRng::seed_from_u64(seed + i as u64))
+            .collect();
     }
 
-    pub fn reset_zeros(&mut self) -> Obs {
+    pub fn reset(&mut self) -> Obs<'_> {
         self.steps.fill(0);
-        for c in self.cars.iter_mut() {
+        for (i, c) in self.cars.iter_mut().enumerate() {
+            let ri = self.rngs[i].random_range(0..self.map.ordered_skeleton.len());
+            let (px, py, th) = self.map.skeleton_point(ri);
             *c = Car {
-                x: 0.0,
-                y: 0.0,
-                theta: 0.0,
+                x: px,
+                y: py,
+                theta: th,
                 velocity: 0.0,
                 steering: 0.0,
                 yaw_rate: 0.0,
                 slip_angle: 0.0,
+                params: CarParams::random(&mut self.rngs[i], self.dr_frac),
             };
         }
         let nearest = self.map.skeleton_idx(0.0, 0.0);
@@ -96,53 +104,15 @@ impl Sim {
         self.observe()
     }
 
-    pub fn reset(&mut self, poses: &[[f64; 3]]) -> Obs<'_> {
-        self.steps.fill(0);
-        for (c, p) in self.cars.iter_mut().zip(poses) {
-            *c = Car {
-                x: p[0],
-                y: p[1],
-                theta: p[2],
-                velocity: 0.0,
-                steering: 0.0,
-                yaw_rate: 0.0,
-                slip_angle: 0.0,
-            };
-        }
-        for i in 0..self.cars.len() {
-            self.waypoint_idx[i] = self.map.skeleton_idx(self.cars[i].x, self.cars[i].y);
-        }
-        self.observe()
-    }
-
-    pub fn reset_single(&mut self, pose: &[f64; 3], i: usize) {
-        self.steps[i] = 0;
-        self.cars[i] = Car {
-            x: pose[0],
-            y: pose[1],
-            theta: pose[2],
-            velocity: 0.0,
-            steering: 0.0,
-            yaw_rate: 0.0,
-            slip_angle: 0.0,
-        };
-        self.waypoint_idx[i] = self.map.skeleton_idx(self.cars[i].x, self.cars[i].y);
-    }
-
     fn tick(&mut self, actions: Option<&[f64]>) -> Obs<'_> {
-        let n = self.cars.len();
         let n_wps = self.map.ordered_skeleton.len();
         let n_beams = self.n_beams;
         let max_range = self.max_range;
         let max_steps = self.max_steps;
         let dt = self.dt;
-
-        for i in 0..n {
-            self.buf_resets[i] = self.rng.random_range(0..n_wps);
-        }
-
         let map = &self.map;
         let beam_sin_cos = &self.beam_sin_cos;
+        let dr_fract = self.dr_frac;
 
         self.buf_terminated
             .par_iter_mut()
@@ -153,14 +123,14 @@ impl Sim {
             .zip(self.steps.par_iter_mut())
             .zip(self.buf_scans.par_chunks_mut(n_beams + 2))
             .zip(self.buf_state.par_chunks_mut(7))
-            .zip(self.buf_resets.par_iter())
+            .zip(self.rngs.par_iter_mut())
             .enumerate()
             .for_each(
                 |(
                     i,
                     (
                         (((((((terminated, truncated), reward), car), wp_idx), step), scan), state),
-                        reset,
+                        rng,
                     ),
                 )| {
                     if let Some(actions) = actions {
@@ -183,19 +153,18 @@ impl Sim {
                     *reward = delta / n_wps as f64 * 100.0 - if *terminated { 100.0 } else { 0.0 };
 
                     if *terminated || *truncated {
-                        let ri = self.buf_resets[i];
-                        let wp = map.ordered_skeleton[ri];
-                        let nxt = map.ordered_skeleton[(ri + 1) % n_wps];
-                        let th = (nxt[1] - wp[1]).atan2(nxt[0] - wp[0]);
+                        let ri = rng.random_range(0..n_wps);
+                        let (px, py, th) = map.skeleton_point(ri);
                         *step = 0;
                         *car = Car {
-                            x: wp[0],
-                            y: wp[1],
+                            x: px,
+                            y: py,
                             theta: th,
                             velocity: 0.0,
                             steering: 0.0,
                             yaw_rate: 0.0,
                             slip_angle: 0.0,
+                            params: CarParams::random(rng, dr_fract),
                         };
                         *wp_idx = ri;
                     }

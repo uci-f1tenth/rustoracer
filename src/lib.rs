@@ -2,6 +2,7 @@ mod car;
 mod map;
 #[cfg(feature = "python")]
 mod python;
+#[cfg(feature = "python")]
 mod render;
 mod sim;
 mod skeleton;

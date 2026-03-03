@@ -1,13 +1,3 @@
-# /// script
-# requires-python = ">=3.14"
-# dependencies = [
-#     "tensordict>=0.11.0",
-#     "torch>=2.10.0",
-#     "tqdm>=4.67.3",
-#     "tyro>=1.0.8",
-#     "wandb[media]>=0.25.0",
-# ]
-# ///
 from __future__ import annotations
 
 import math

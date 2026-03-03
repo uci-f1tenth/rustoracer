@@ -39,7 +39,7 @@ mod rustoracer {
             Bound<'py, PyArray1<bool>>,
             Bound<'py, PyArray1<f64>>,
         ) {
-            let o = self.sim.reset_zeros();
+            let o = self.sim.reset();
             (
                 o.scans.to_pyarray(py),
                 o.rewards.to_pyarray(py),
@@ -182,10 +182,6 @@ mod rustoracer {
             numpy::ndarray::Array3::from_shape_vec((h as usize, w as usize, 3), buf)
                 .unwrap()
                 .into_pyarray(py)
-        }
-
-        fn reset_single(&mut self, i: usize) {
-            self.sim.reset_single(&[0.0, 0.0, 0.0], i);
         }
 
         fn observe<'py>(
