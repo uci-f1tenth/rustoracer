@@ -43,7 +43,7 @@ impl Sim {
             .map(|a| a.sin_cos())
             .collect();
         let map = OccGrid::load(yaml);
-        let (px, py, th) = map.skeleton_point(0);
+        let (px, py, th) = map.skeleton.get_point(0);
         Self {
             map,
             cars: vec![
@@ -86,8 +86,8 @@ impl Sim {
     pub fn reset(&mut self) -> Obs<'_> {
         self.steps.fill(0);
         for (i, c) in self.cars.iter_mut().enumerate() {
-            let ri = self.rngs[i].random_range(0..self.map.ordered_skeleton.len());
-            let (px, py, th) = self.map.skeleton_point(ri);
+            let ri = self.rngs[i].random_range(0..self.map.skeleton.points.len());
+            let (px, py, th) = self.map.skeleton.get_point(ri);
             *c = Car {
                 x: px,
                 y: py,
@@ -99,13 +99,14 @@ impl Sim {
                 params: CarParams::random(&mut self.rngs[i], self.dr_frac),
             };
         }
-        let nearest = self.map.skeleton_idx(0.0, 0.0);
+        let (px, py) = self.map.position_to_pixels(0.0, 0.0);
+        let nearest = self.map.skeleton.get_idx(px, py);
         self.waypoint_idx.fill(nearest);
         self.observe()
     }
 
     fn tick(&mut self, actions: Option<&[f64]>) -> Obs<'_> {
-        let n_wps = self.map.ordered_skeleton.len();
+        let n_wps = self.map.skeleton.points.len();
         let n_beams = self.n_beams;
         let max_range = self.max_range;
         let max_steps = self.max_steps;
@@ -142,7 +143,8 @@ impl Sim {
                     *truncated = *step >= max_steps;
 
                     let prev_idx = *wp_idx;
-                    *wp_idx = map.skeleton_idx(car.x, car.y);
+                    let (px, py) = map.position_to_pixels(car.x, car.y);
+                    *wp_idx = map.skeleton.get_idx(px, py);
 
                     let mut delta = *wp_idx as f64 - prev_idx as f64;
                     if delta > n_wps as f64 / 2.0 {
@@ -154,7 +156,7 @@ impl Sim {
 
                     if *terminated || *truncated {
                         let ri = rng.random_range(0..n_wps);
-                        let (px, py, th) = map.skeleton_point(ri);
+                        let (px, py, th) = map.skeleton.get_point(ri);
                         *step = 0;
                         *car = Car {
                             x: px,

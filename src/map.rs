@@ -1,3 +1,5 @@
+use std::f64::consts::PI;
+
 use crate::car::{Car, LENGTH, WIDTH};
 use crate::skeleton::{extract_main_loop, thin_image_edges};
 use image::GrayImage;
@@ -6,8 +8,6 @@ use kiddo::SquaredEuclidean;
 use kiddo::immutable::float::kdtree::ImmutableKdTree;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::Deserialize;
-#[cfg(feature = "show_images")]
-use show_image::{ImageInfo, ImageView, create_window};
 
 #[derive(Deserialize)]
 struct MapMeta {
@@ -16,54 +16,30 @@ struct MapMeta {
     origin: [f64; 3],
 }
 
-pub struct OccGrid {
-    inv_res: f64,
-    pub img: GrayImage,
-    pub edt: Vec<f64>,
-    pub ordered_skeleton: Vec<[f64; 2]>,
-    pub skeleton_lut: Vec<usize>,
-    pub res: f64,
-    pub ox: f64,
-    pub oy: f64,
+pub struct Skeleton {
+    width: u32,
+    pub points: Vec<[f64; 2]>,
+    pub lut: Vec<usize>,
 }
 
-#[cfg(feature = "show_images")]
-fn view_image(img: &GrayImage, title: &str) {
-    let window = create_window(title, Default::default()).unwrap();
-    let image_view = ImageView::new(ImageInfo::mono8(img.width(), img.height()), img.as_raw());
-    window.set_image(title, image_view).unwrap();
-}
-
-impl OccGrid {
-    pub fn load(yaml: &str) -> Self {
-        let m: MapMeta = serde_saphyr::from_str(&std::fs::read_to_string(yaml).unwrap()).unwrap();
-        let dir = std::path::Path::new(yaml).parent().unwrap();
-        let img = image::open(dir.join(&m.image)).unwrap().into_luma8();
-        let mut occupied_image = img.clone();
-        for pixel in occupied_image.pixels_mut() {
-            pixel.0[0] = if pixel.0[0] < 128 { 255 } else { 0 };
+impl Skeleton {
+    pub fn new(img: &GrayImage, res: f64, ox: f64, oy: f64, otheta: f64) -> Self {
+        let mut ordered_skeleton = extract_main_loop(&mut thin_image_edges(img), res, ox, oy);
+        if ordered_skeleton.len() >= 2 {
+            let dy = ordered_skeleton[1][1] - ordered_skeleton[0][1];
+            let dx = ordered_skeleton[1][0] - ordered_skeleton[0][0];
+            let diff = (dy.atan2(dx) - otheta + 3.0 * PI) % (2.0 * PI) - PI;
+            if diff.abs() > std::f64::consts::FRAC_PI_2 {
+                ordered_skeleton[1..].reverse();
+            }
         }
-        let edt = euclidean_squared_distance_transform(&occupied_image);
-        let mut skeleton = thin_image_edges(&occupied_image);
-        let ordered_skeleton =
-            extract_main_loop(&mut skeleton, m.resolution, m.origin[0], m.origin[1]);
-        #[cfg(feature = "show_images")]
-        view_image(&occupied_image, "occupied");
-        #[cfg(feature = "show_images")]
-        view_image(&skeleton, "skeleton");
         let skeleton_tree = ImmutableKdTree::new_from_slice(&ordered_skeleton);
-        let (w, h) = (img.width(), img.height());
-        let skeleton_lut =
-            Self::build_skeleton_lut(&skeleton_tree, w, h, m.resolution, m.origin[0], m.origin[1]);
+        let skeleton_lut: Vec<usize> =
+            Self::build_skeleton_lut(&skeleton_tree, img.width(), img.height(), res, ox, oy);
         Self {
-            inv_res: 1.0 / m.resolution,
-            img,
-            edt: edt.pixels().map(|p| p.0[0].sqrt() * m.resolution).collect(),
-            ordered_skeleton,
-            skeleton_lut,
-            res: m.resolution,
-            ox: m.origin[0],
-            oy: m.origin[1],
+            points: ordered_skeleton,
+            lut: skeleton_lut,
+            width: img.width(),
         }
     }
 
@@ -87,16 +63,52 @@ impl OccGrid {
             .collect()
     }
 
-    pub fn skeleton_point(&self, idx: usize) -> (f64, f64, f64) {
-        let [px, py] = self.ordered_skeleton[idx];
-        let [nxt_px, nxt_py] = self.ordered_skeleton[(idx + 1) % self.ordered_skeleton.len()];
-        let theta = (nxt_py - py).atan2(nxt_px - px);
-        (px, py, theta)
+    pub fn get_point(&self, idx: usize) -> (f64, f64, f64) {
+        let [px, py] = self.points[idx];
+        let [nxt_px, nxt_py] = self.points[(idx + 1) % self.points.len()];
+        (px, py, (nxt_py - py).atan2(nxt_px - px))
     }
 
-    pub fn skeleton_idx(&self, x: f64, y: f64) -> usize {
-        let (px, py) = self.position_to_pixels(x, y);
-        self.skeleton_lut[(py * self.img.width() + px) as usize]
+    pub fn get_idx(&self, px: u32, py: u32) -> usize {
+        self.lut[(py * self.width + px) as usize]
+    }
+}
+
+pub struct OccGrid {
+    inv_res: f64,
+    pub img: GrayImage,
+    pub edt: Vec<f64>,
+    pub skeleton: Skeleton,
+    pub res: f64,
+    pub ox: f64,
+    pub oy: f64,
+}
+
+impl OccGrid {
+    pub fn load(yaml: &str) -> Self {
+        let m: MapMeta = serde_saphyr::from_str(&std::fs::read_to_string(yaml).unwrap()).unwrap();
+        let dir = std::path::Path::new(yaml).parent().unwrap();
+        let img = image::open(dir.join(&m.image)).unwrap().into_luma8();
+        let mut occupied_image = img.clone();
+        for pixel in occupied_image.pixels_mut() {
+            pixel.0[0] = if pixel.0[0] < 128 { 255 } else { 0 };
+        }
+        let edt = euclidean_squared_distance_transform(&occupied_image);
+        Self {
+            inv_res: 1.0 / m.resolution,
+            img,
+            edt: edt.pixels().map(|p| p.0[0].sqrt() * m.resolution).collect(),
+            skeleton: Skeleton::new(
+                &occupied_image,
+                m.resolution,
+                m.origin[0],
+                m.origin[1],
+                m.origin[2],
+            ),
+            res: m.resolution,
+            ox: m.origin[0],
+            oy: m.origin[1],
+        }
     }
 
     #[inline]
@@ -112,7 +124,7 @@ impl OccGrid {
             unsafe {
                 *self
                     .edt
-                    .get_unchecked((px + py * self.img.width()) as usize)
+                    .get_unchecked((py * self.img.width() + px) as usize)
             }
         } else {
             0.0

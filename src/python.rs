@@ -170,7 +170,8 @@ mod rustoracer {
             let flat: Vec<f64> = self
                 .sim
                 .map
-                .ordered_skeleton
+                .skeleton
+                .points
                 .iter()
                 .flat_map(|p| p.iter().copied())
                 .collect();

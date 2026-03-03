@@ -9,7 +9,6 @@ mod skeleton;
 use crate::sim::Sim;
 
 #[cfg(not(feature = "ros"))]
-#[cfg_attr(feature = "show_images", show_image::main)]
 fn main() {
     let mut sim = Sim::new("maps/skirk.yaml", 1, 10_000);
     sim.reset();
