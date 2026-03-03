@@ -3,6 +3,10 @@
 ```bash
 uv run --with torch --with tensordict --with tqdm --with tyro --with wandb[media] scripts/learnrl.py
 ```
+### autodrive learnrl
+```bash
+uv run --python 3.10 scripts/learnrl_autodrive.py
+```
 
 ## Devcontainer
 Rebuild and reopen in container

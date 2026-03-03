@@ -41,7 +41,9 @@ class Agent(nn.Module):
 
 # ── Load checkpoint ──
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ckpt = torch.load("checkpoints/agent_final.pt", map_location=DEVICE, weights_only=False)
+ckpt = torch.load(
+    "checkpoints/agent_39321600.pt", map_location=DEVICE, weights_only=False
+)
 agent = Agent()
 agent.load_state_dict(ckpt["model"], strict=False)
 agent.to(DEVICE).eval()
@@ -86,7 +88,7 @@ def bridge(sid, data):
             torch.tensor(get_obs(f1), device=DEVICE, dtype=torch.float32).unsqueeze(0)
         )
     a = act.cpu().numpy().flatten().clip(-1, 1)
-    f1.steering_command, f1.throttle_command = float(a[0]), float(a[1])
+    f1.steering_command, f1.throttle_command = float(a[0]), (float(a[1]) + 1) / 2
     try:
         sio.emit("Bridge", data=f1.generate_commands())
     except Exception as e:

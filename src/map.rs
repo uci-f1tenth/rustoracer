@@ -184,9 +184,10 @@ impl OccGrid {
         }
         let (px, py) = self.position_to_pixels(car.x, car.y);
         let center_clearance = self.edt(px, py);
-        const CAR_CIRCUMRADIUS: f64 = 0.328824; // sqrt((LENGTH/2)^2 + (WIDTH/2)^2)
+        const CAR_CIRCUMRADIUS_SQ: f64 =
+            (LENGTH / 2.0) * (LENGTH / 2.0) + (WIDTH / 2.0) * (WIDTH / 2.0);
 
-        if center_clearance > CAR_CIRCUMRADIUS {
+        if center_clearance * center_clearance > CAR_CIRCUMRADIUS_SQ {
             return false;
         }
         self.car_pixels(car)
