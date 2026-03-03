@@ -235,15 +235,16 @@ pub fn extract_main_loop(img: &mut GrayImage, res: f64, ox: f64, oy: f64) -> Vec
         .map(|(x, y, _)| (x, y))
         .collect();
 
-    let (cx, cy) = (img.width() / 2, img.height() / 2);
-    let start = match fg
+    let origin_px = (-ox / res, (img.height() - 1) as f64 + oy / res);
+    let start = fg
         .iter()
         .copied()
-        .min_by_key(|&(x, y)| (x as i64 - cx as i64).pow(2) + (y as i64 - cy as i64).pow(2))
-    {
-        Some(s) => s,
-        None => return Vec::new(),
-    };
+        .min_by_key(|&(x, y)| {
+            let dx = x as f64 - origin_px.0;
+            let dy = y as f64 - origin_px.1;
+            (dx * dx + dy * dy) as i64
+        })
+        .unwrap();
 
     let nbrs = neighbors(&fg, start.0, start.1);
     if nbrs.len() < 2 {
