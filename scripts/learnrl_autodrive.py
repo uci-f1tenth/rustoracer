@@ -41,9 +41,7 @@ class Agent(nn.Module):
 
 # ── Load checkpoint ──
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ckpt = torch.load(
-    "checkpoints/agent_39321600.pt", map_location=DEVICE, weights_only=False
-)
+ckpt = torch.load("checkpoints/agent_final.pt", map_location=DEVICE, weights_only=False)
 agent = Agent()
 agent.load_state_dict(ckpt["model"], strict=False)
 agent.to(DEVICE).eval()
