@@ -23,6 +23,7 @@ pub struct Sim {
     pub n_beams: usize,
     pub fov: f64,
     pub max_range: f64,
+    pub min_range: f64,
     pub rngs: Vec<SmallRng>,
     pub waypoint_idx: Vec<usize>,
     pub steps: Vec<u32>,
@@ -67,7 +68,8 @@ impl Sim {
             ds: 6,
             n_beams,
             fov,
-            max_range: 30.0,
+            max_range: 10.0,
+            min_range: 0.06,
             rngs: (0..n).map(|i| SmallRng::seed_from_u64(i as u64)).collect(),
             waypoint_idx: vec![0; n],
             steps: vec![0; n],
@@ -115,6 +117,7 @@ impl Sim {
         let n_wps = self.map.skeleton.points.len();
         let n_beams = self.n_beams;
         let max_range = self.max_range;
+        let min_range = self.min_range;
         let max_steps = self.max_steps;
         let dt = self.dt;
         let ds = self.ds;
@@ -190,7 +193,7 @@ impl Sim {
                         let dy = sin_h * cos_a + cos_h * sin_a;
                         let noise = rng.random_range(-0.03_f64..=0.03);
                         scan[j] = (map.raycast(car.x, car.y, dx, dy, max_range) + noise)
-                            .clamp(0.0, max_range);
+                            .clamp(min_range, max_range);
                     }
                     scan[n_beams] = car.velocity;
                     scan[n_beams + 1] = car.steering;

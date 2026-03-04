@@ -5,14 +5,14 @@ pub const G: f64 = 9.81;
 
 // ── Constraint limits ────────────────────────────────────────────────────────
 
-pub const STEER_MIN: f64 = -0.4189;
-pub const STEER_MAX: f64 = 0.4189;
+const STEER_MIN: f64 = -0.5236;
+const STEER_MAX: f64 = 0.5236;
 pub const STEER_VEL_MIN: f64 = -3.2;
 pub const STEER_VEL_MAX: f64 = 3.2;
 pub const V_MIN: f64 = -5.0;
 pub const V_MAX: f64 = 20.0;
-pub const WIDTH: f64 = 0.31;
-pub const LENGTH: f64 = 0.58;
+pub const WIDTH: f64 = 0.27;
+pub const LENGTH: f64 = 0.50;
 const CD_A_RHO_HALF: f64 = 0.5 * 0.3 * 0.04 * 1.225; // aero drag 0.5·Cd·A·ρ
 
 // ── Model blending parameters (smooth kinematic↔dynamic transition) ──────────
@@ -42,17 +42,17 @@ const OMEGA_TAU: f64 = 0.02; // time constant for kinematic wheel speed tracking
 // the wheel dynamics time constant at ~5–10 ms, which is well-resolved
 // by RK4 at typical simulation timesteps (1–10 ms).
 
-const DEF_LF: f64 = 0.15875;
-const DEF_LR: f64 = 0.17145;
-const DEF_H: f64 = 0.074;
-const DEF_MASS: f64 = 3.74;
+const DEF_LF: f64 = 0.15532;
+const DEF_LR: f64 = 0.16868;
+const DEF_H: f64 = 0.01434;
+const DEF_MASS: f64 = 3.906;
 const DEF_I_Z: f64 = 0.04712;
 const DEF_V_SWITCH: f64 = 7.319;
 const DEF_A_MAX: f64 = 9.51;
-const DEF_R_W: f64 = 0.032; // effective tire radius [m]
-const DEF_I_YW: f64 = 0.004; // effective wheel + drivetrain inertia [kg·m²]
+const DEF_R_W: f64 = 0.059; // effective tire radius [m]
+const DEF_I_YW: f64 = 0.008; // effective wheel + drivetrain inertia [kg·m²]
 const DEF_T_SB: f64 = 0.5; // brake torque split to front axle
-const DEF_T_SE: f64 = 0.0; // engine torque split to front axle (0 = RWD)
+const DEF_T_SE: f64 = 0.5; // engine torque split to front axle (0 = RWD)
 
 /// State vector: [sx, sy, δ, v, ψ, ψ̇, β, ωf, ωr]
 type State = [f64; 9];
