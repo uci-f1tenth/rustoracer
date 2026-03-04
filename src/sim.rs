@@ -19,6 +19,7 @@ pub struct Sim {
     pub cars: Vec<Car>,
     pub dr_frac: f64,
     pub dt: f64,
+    pub ds: usize,
     pub n_beams: usize,
     pub fov: f64,
     pub max_range: f64,
@@ -55,12 +56,15 @@ impl Sim {
                     steering: 0.0,
                     yaw_rate: 0.0,
                     slip_angle: 0.0,
+                    omega_f: 0.0,
+                    omega_r: 0.0,
                     params: CarParams::default(),
                 };
                 n
             ],
             dr_frac: 0.2,
             dt: 1.0 / 60.0,
+            ds: 10,
             n_beams,
             fov,
             max_range: 30.0,
@@ -96,6 +100,8 @@ impl Sim {
                 steering: 0.0,
                 yaw_rate: 0.0,
                 slip_angle: 0.0,
+                omega_f: 0.0,
+                omega_r: 0.0,
                 params: CarParams::random(&mut self.rngs[i], self.dr_frac),
             };
         }
@@ -111,6 +117,7 @@ impl Sim {
         let max_range = self.max_range;
         let max_steps = self.max_steps;
         let dt = self.dt;
+        let ds = self.ds;
         let map = &self.map;
         let beam_sin_cos = &self.beam_sin_cos;
         let dr_fract = self.dr_frac;
@@ -136,7 +143,9 @@ impl Sim {
                 )| {
                     if let Some(actions) = actions {
                         *step += 1;
-                        car.step(actions[i * 2], actions[i * 2 + 1], dt);
+                        for _ in 0..ds {
+                            car.step(actions[i * 2], actions[i * 2 + 1], dt / ds as f64);
+                        }
                     }
 
                     *terminated = map.car_collides(car);
@@ -166,6 +175,8 @@ impl Sim {
                             steering: 0.0,
                             yaw_rate: 0.0,
                             slip_angle: 0.0,
+                            omega_f: 0.0,
+                            omega_r: 0.0,
                             params: CarParams::random(rng, dr_fract),
                         };
                         *wp_idx = ri;
