@@ -64,7 +64,7 @@ impl Sim {
             ],
             dr_frac: 0.2,
             dt: 1.0 / 60.0,
-            ds: 10,
+            ds: 6,
             n_beams,
             fov,
             max_range: 30.0,
@@ -161,7 +161,9 @@ impl Sim {
                     } else if delta < -(n_wps as f64 / 2.0) {
                         delta += n_wps as f64;
                     }
-                    *reward = delta / n_wps as f64 * 100.0 - if *terminated { 100.0 } else { 0.0 };
+                    *reward = delta / n_wps as f64 * 100.0 * (1.0 + car.velocity.max(0.0) / 10.0)
+                        - 0.1 / map.edt(px, py).max(0.05)
+                        - if *terminated { 100.0 } else { 0.0 };
 
                     if *terminated || *truncated {
                         let ri = rng.random_range(0..n_wps);
@@ -186,7 +188,9 @@ impl Sim {
                     for (j, &(sin_a, cos_a)) in beam_sin_cos.iter().enumerate() {
                         let dx = cos_h * cos_a - sin_h * sin_a;
                         let dy = sin_h * cos_a + cos_h * sin_a;
-                        scan[j] = map.raycast(car.x, car.y, dx, dy, max_range);
+                        let noise = rng.random_range(-0.03_f64..=0.03);
+                        scan[j] = (map.raycast(car.x, car.y, dx, dy, max_range) + noise)
+                            .clamp(0.0, max_range);
                     }
                     scan[n_beams] = car.velocity;
                     scan[n_beams + 1] = car.steering;

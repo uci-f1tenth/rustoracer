@@ -13,6 +13,7 @@ pub const V_MIN: f64 = -5.0;
 pub const V_MAX: f64 = 20.0;
 pub const WIDTH: f64 = 0.31;
 pub const LENGTH: f64 = 0.58;
+const CD_A_RHO_HALF: f64 = 0.5 * 0.3 * 0.04 * 1.225; // aero drag 0.5·Cd·A·ρ
 
 // ── Model blending parameters (smooth kinematic↔dynamic transition) ──────────
 // Reference: CommonRoad STD Python implementation
@@ -403,9 +404,9 @@ fn std_dynamics(s: &State, a: f64, sv: f64, p: &CarParams) -> State {
         (v * beta.cos() * delta.cos() + (v * beta.sin() + p.lf * psi_dot) * delta.sin()).max(0.0);
     let u_wr = (v * beta.cos()).max(0.0);
 
-    // ── Longitudinal slip ────────────────────────────────────────────────
-    let s_f = 1.0 - p.r_w * omega_f / u_wf.max(V_MIN_DYN);
-    let s_r = 1.0 - p.r_w * omega_r / u_wr.max(V_MIN_DYN);
+    // ── Longitudinal slip (clamped for numerical stability) ──────────────
+    let s_f = (1.0 - p.r_w * omega_f / u_wf.max(V_MIN_DYN)).clamp(-1.0, 1.0);
+    let s_r = (1.0 - p.r_w * omega_r / u_wr.max(V_MIN_DYN)).clamp(-1.0, 1.0);
 
     // ── Pacejka tire forces ──────────────────────────────────────────────
     let fx0_f = tire_fx_pure(s_f, gamma, f_zf, tp);
@@ -425,6 +426,9 @@ fn std_dynamics(s: &State, a: f64, sv: f64, p: &CarParams) -> State {
         (p.mass * p.r_w * a, 0.0)
     };
 
+    // ── Aerodynamic drag ─────────────────────────────────────────────────
+    let f_drag = CD_A_RHO_HALF * v * v * sign(v);
+
     // ══════════════════════════════════════════════════════════════════════
     //  DYNAMIC MODEL (eq. 14–15)
     // ══════════════════════════════════════════════════════════════════════
@@ -433,7 +437,8 @@ fn std_dynamics(s: &State, a: f64, sv: f64, p: &CarParams) -> State {
         * (-f_yf * (delta - beta).sin()
             + f_yr * beta.sin()
             + f_xr * beta.cos()
-            + f_xf * (delta - beta).cos());
+            + f_xf * (delta - beta).cos()
+            - f_drag);
 
     let dd_psi_dyn =
         (1.0 / p.i_z) * (f_yf * delta.cos() * p.lf - f_yr * p.lr + f_xf * delta.sin() * p.lf);
@@ -473,7 +478,7 @@ fn std_dynamics(s: &State, a: f64, sv: f64, p: &CarParams) -> State {
     //  KINEMATIC MODEL at COG (eq. 13)
     // ══════════════════════════════════════════════════════════════════════
 
-    let d_v_ks = a;
+    let d_v_ks = a - f_drag / p.mass;
     let d_psi_ks = v * beta.cos() / lwb * delta.tan();
 
     let cos2_d = delta.cos().powi(2);
@@ -581,8 +586,13 @@ impl Car {
     pub fn step(&mut self, steer: f64, speed: f64, dt: f64) {
         let p = &self.params;
         let (raw_a, raw_sv) = pid(steer, speed, self.velocity, self.steering, p);
-        let a = accel_constraint(self.velocity, raw_a, p);
+        let mut a = accel_constraint(self.velocity, raw_a, p);
         let sv = steering_constraint(self.steering, raw_sv);
+
+        // ── Kamm's circle (eq. 3): combined friction limit ──────────────
+        let a_lat = self.velocity * self.yaw_rate;
+        let a_max_remaining = (p.a_max * p.a_max - a_lat * a_lat).max(0.0).sqrt();
+        a = a.clamp(-a_max_remaining, a_max_remaining);
 
         let state: State = [
             self.x,
