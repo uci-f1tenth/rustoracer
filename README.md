@@ -3,6 +3,11 @@
 ```bash
 uv run --with torch --with tensordict --with tqdm --with tyro --with wandb[media] scripts/learnrl.py
 ```
+### learnrl.py w/ CUDA
+```bash
+uv run --with torch --with tensordict --with tqdm --with tyro --with wandb[media] --index https://download.pytorch.org/whl/cu130 scripts/learnrl.py
+```
+Make sure you have CUDA installed! :P
 ### autodrive learnrl
 ```bash
 uv run --python 3.10 scripts/learnrl_autodrive.py
