@@ -30,15 +30,29 @@ source disparity_extender/install/setup.bash
 ros2 launch disparity_extender disparity_extender.launch.py
 ```
 # Roboracer install
+## Start devkit
 ```bash
 cd scripts/autodrive_devkit/
 colcon build
 source install/setup.bash
 ros2 launch autodrive_roboracer bringup_headless.launch.py
 ```
+## Start foxglove
+```bash
+ros2 launch foxglove_bridge foxglove_bridge_launch.xml
+```
+## Start slam_tooblox
+```bash
+ros2 launch slam_toolbox online_async_launch.py slam_params_file:=autodrive_online_async_roboracer.yaml
+```
+## Start wall follow
 ```bash
 cd scripts/wall_follow
 colcon build
 source install/setup.bash
 ros2 launch wall_follow wall_follow.launch.py
+```
+## Save map
+```bash
+ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap "{name: {data: '/workspaces/rustoracer/my_map'}}"
 ```
