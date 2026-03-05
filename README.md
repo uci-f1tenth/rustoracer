@@ -7,7 +7,6 @@ uv run --with torch --with tensordict --with tqdm --with tyro --with wandb[media
 ```bash
 uv run --python 3.10 scripts/learnrl_autodrive.py
 ```
-
 ## Devcontainer
 Rebuild and reopen in container
 ## Starting up scripts
@@ -29,4 +28,17 @@ ros2 launch wall_follow wall_follow.launch.py
 cd disparity_extender && colcon build && cd ..
 source disparity_extender/install/setup.bash
 ros2 launch disparity_extender disparity_extender.launch.py
+```
+# Roboracer install
+```bash
+cd scripts/autodrive_devkit/
+colcon build
+source install/setup.bash
+ros2 launch autodrive_roboracer bringup_headless.launch.py
+```
+```bash
+cd scripts/wall_follow
+colcon build
+source install/setup.bash
+ros2 launch wall_follow wall_follow.launch.py
 ```
