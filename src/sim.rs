@@ -164,8 +164,14 @@ impl Sim {
                     } else if delta < -(n_wps as f64 / 2.0) {
                         delta += n_wps as f64;
                     }
+                    let d_steer_abs = if let Some(actions) = actions {
+                        actions[i * 2].abs()
+                    } else {
+                        0.0
+                    };
                     *reward = delta / n_wps as f64 * 100.0 * (1.0 + car.velocity.max(0.0) / 10.0)
                         - 0.1 / map.edt(px, py).max(0.05)
+                        - 0.05 * d_steer_abs
                         - if *terminated { 100.0 } else { 0.0 };
 
                     if *terminated || *truncated {

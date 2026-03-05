@@ -7,8 +7,6 @@ use crate::Sim;
 mod rustoracer {
     use numpy::PyReadonlyArray1;
 
-    use crate::car::{STEER_MAX, STEER_MIN, V_MAX};
-
     use super::*;
 
     #[pyclass]
@@ -60,17 +58,7 @@ mod rustoracer {
             Bound<'py, PyArray1<bool>>,
             Bound<'py, PyArray1<f64>>,
         ) {
-            let raw = actions.as_slice().unwrap();
-            let rescaled: Vec<f64> = raw
-                .chunks(2)
-                .flat_map(|a| {
-                    [
-                        STEER_MIN + (a[0] + 1.0) * 0.5 * (STEER_MAX - STEER_MIN),
-                        1.0 + (a[1] + 1.0) * 0.5 * (V_MAX - 1.0),
-                    ]
-                })
-                .collect();
-            let o = self.sim.step(&rescaled);
+            let o = self.sim.step(&actions.as_slice().unwrap());
             (
                 o.scans.to_pyarray(py),
                 o.rewards.to_pyarray(py),

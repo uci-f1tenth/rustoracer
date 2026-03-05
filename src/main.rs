@@ -13,7 +13,7 @@ fn main() {
     let mut sim = Sim::new("maps/skirk.yaml", 1, 10_000);
     sim.reset();
     for _ in 0..1_000_000 {
-        let _obs = sim.step(&[0.0, 1.0]);
+        let _obs = sim.step(&[0.0, 0.5]);
     }
 }
 

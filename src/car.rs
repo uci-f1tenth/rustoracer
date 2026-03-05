@@ -5,8 +5,8 @@ pub const G: f64 = 9.81;
 
 // ── Constraint limits ────────────────────────────────────────────────────────
 
-const STEER_MIN: f64 = -0.5236;
-const STEER_MAX: f64 = 0.5236;
+pub const STEER_MIN: f64 = -0.5236;
+pub const STEER_MAX: f64 = 0.5236;
 pub const STEER_VEL_MIN: f64 = -3.2;
 pub const STEER_VEL_MAX: f64 = 3.2;
 pub const V_MIN: f64 = -5.0;
@@ -357,24 +357,10 @@ fn steering_constraint(steer: f64, sv: f64) -> f64 {
     }
 }
 
-fn accel_constraint(vel: f64, a: f64, p: &CarParams) -> f64 {
-    let a_max = if vel > p.v_switch {
-        p.a_max * p.v_switch / vel
-    } else {
-        p.a_max
-    };
-    let a = a.clamp(-p.a_max, a_max);
-    match a {
-        a if a < 0.0 && vel <= V_MIN => 0.0,
-        a if a > 0.0 && vel >= V_MAX => 0.0,
-        a => a,
-    }
-}
-
 // ── Single-Track Drift dynamics (CommonRoad §8, eq. 14–16) ───────────────────
 // Smoothly blended with kinematic model at low speeds via tanh weighting.
 
-fn std_dynamics(s: &State, a: f64, sv: f64, p: &CarParams) -> State {
+fn std_dynamics(s: &State, torque: f64, sv: f64, p: &CarParams) -> State {
     let [_sx, _sy, delta, v, psi, psi_dot, beta, omega_f, omega_r] = *s;
     let lwb = p.lwb();
     let tp = &p.tire;
@@ -395,9 +381,12 @@ fn std_dynamics(s: &State, a: f64, sv: f64, p: &CarParams) -> State {
         (0.0, 0.0)
     };
 
+    // ── Estimated acceleration (for load transfer & kinematic model) ─────
+    let a_est = torque / (p.mass * p.r_w);
+
     // ── Vertical tire forces (load transfer) ─────────────────────────────
-    let f_zf = p.mass * (-a * p.h + G * p.lr) / lwb;
-    let f_zr = p.mass * (a * p.h + G * p.lf) / lwb;
+    let f_zf = p.mass * (-a_est * p.h + G * p.lr) / lwb;
+    let f_zr = p.mass * (a_est * p.h + G * p.lf) / lwb;
 
     // ── Individual tire velocities ───────────────────────────────────────
     let u_wf =
@@ -419,11 +408,11 @@ fn std_dynamics(s: &State, a: f64, sv: f64, p: &CarParams) -> State {
     let f_yf = tire_fy_combined(s_f, alpha_f, gamma, mu_yf, f_zf, fy0_f, tp);
     let f_yr = tire_fy_combined(s_r, alpha_r, gamma, mu_yr, f_zr, fy0_r, tp);
 
-    // ── Acceleration → brake / engine torque (eq. 21) ────────────────────
-    let (t_b, t_e) = if a > 0.0 {
-        (0.0, p.mass * p.r_w * a)
+    // ── Torque split → brake / engine (eq. 21) ──────────────────────────
+    let (t_b, t_e) = if torque > 0.0 {
+        (0.0, torque)
     } else {
-        (p.mass * p.r_w * a, 0.0)
+        (torque, 0.0)
     };
 
     // ── Aerodynamic drag ─────────────────────────────────────────────────
@@ -478,7 +467,7 @@ fn std_dynamics(s: &State, a: f64, sv: f64, p: &CarParams) -> State {
     //  KINEMATIC MODEL at COG (eq. 13)
     // ══════════════════════════════════════════════════════════════════════
 
-    let d_v_ks = a - f_drag / p.mass;
+    let d_v_ks = a_est - f_drag / p.mass;
     let d_psi_ks = v * beta.cos() / lwb * delta.tan();
 
     let cos2_d = delta.cos().powi(2);
@@ -491,7 +480,7 @@ fn std_dynamics(s: &State, a: f64, sv: f64, p: &CarParams) -> State {
 
     let dd_psi_ks = if cos2_d.abs() > 1e-10 {
         (1.0 / lwb)
-            * (a * beta.cos() * delta.tan() - v * beta.sin() * d_beta_ks * delta.tan()
+            * (a_est * beta.cos() * delta.tan() - v * beta.sin() * d_beta_ks * delta.tan()
                 + v * beta.cos() / cos2_d * sv)
     } else {
         0.0
@@ -529,19 +518,6 @@ fn rk4(y: &State, dt: f64, f: impl Fn(&State) -> State) -> State {
     let k3 = f(&std::array::from_fn(|i| y[i] + k2[i] * dt / 2.0));
     let k4 = f(&std::array::from_fn(|i| y[i] + k3[i] * dt));
     std::array::from_fn(|i| y[i] + dt / 6.0 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]))
-}
-
-// ── PID controller ───────────────────────────────────────────────────────────
-
-fn pid(target_steer: f64, target_speed: f64, vx: f64, steer: f64, p: &CarParams) -> (f64, f64) {
-    let sv = if (target_steer - steer).abs() > 1e-4 {
-        (target_steer - steer).signum() * STEER_VEL_MAX
-    } else {
-        0.0
-    };
-    let kp = if vx > 0.0 { 10.0 } else { 2.0 } * p.a_max
-        / if target_speed > vx { V_MAX } else { -V_MIN };
-    (kp * (target_speed - vx), sv)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -583,16 +559,15 @@ impl Car {
         }
     }
 
-    pub fn step(&mut self, steer: f64, speed: f64, dt: f64) {
+    pub fn step(&mut self, d_steer: f64, torque: f64, dt: f64) {
         let p = &self.params;
-        let (raw_a, raw_sv) = pid(steer, speed, self.velocity, self.steering, p);
-        let mut a = accel_constraint(self.velocity, raw_a, p);
-        let sv = steering_constraint(self.steering, raw_sv);
 
-        // ── Kamm's circle (eq. 3): combined friction limit ──────────────
-        let a_lat = self.velocity * self.yaw_rate;
-        let a_max_remaining = (p.a_max * p.a_max - a_lat * a_lat).max(0.0).sqrt();
-        a = a.clamp(-a_max_remaining, a_max_remaining);
+        // ── Steering: interpret d_steer [-1, 1] as normalized steering velocity
+        let sv = steering_constraint(self.steering, d_steer * STEER_VEL_MAX);
+
+        // ── Rescale normalized torque [-1, 1] to physical units ─────────
+        let t_max = p.mass * p.a_max * p.r_w;
+        let torque = torque.clamp(-1.0, 1.0) * t_max;
 
         let state: State = [
             self.x,
@@ -606,7 +581,8 @@ impl Car {
             self.omega_r,
         ];
 
-        let [x, y, s, vx, yaw, yr, slip, wf, wr] = rk4(&state, dt, |s| std_dynamics(s, a, sv, p));
+        let [x, y, s, vx, yaw, yr, slip, wf, wr] =
+            rk4(&state, dt, |s| std_dynamics(s, torque, sv, p));
 
         self.x = x;
         self.y = y;

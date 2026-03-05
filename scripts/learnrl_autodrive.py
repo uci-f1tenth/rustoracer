@@ -20,11 +20,29 @@
 #     "werkzeug==2.0.3",
 # ]
 # ///
-"""Rustoracer PPO agent → AutoDrive F1TENTH bridge."""
+"""Rustoracer PPO agent → AutoDrive F1TENTH bridge.
+
+The trained model outputs [d_steer, torque] both in [-1, 1]:
+  - d_steer: normalized steering velocity (±1 → ±3.2 rad/s)
+  - torque:  normalized drive torque (±1 → full brake/throttle)
+
+AutoDRIVE accepts:
+  - steering_command in [-1, 1] → maps to [-0.5236, 0.5236] rad (±30°)
+  - throttle_command in [-1, 1] → maps to full reverse/forward torque
+
+We integrate d_steer into a tracked steering angle (matching the sim)
+and send it as a normalized steering command.
+"""
 
 import time, numpy as np, torch, torch.nn as nn, socketio, eventlet
 from flask import Flask
 import autodrive
+
+# ── Vehicle constants (from AutoDRIVE docs / sim) ──
+STEER_MAX = 0.5236  # rad (±30°)
+STEER_VEL_MAX = 3.2  # rad/s  (steering rate limit)
+N_LIDAR_RAW = 1080  # AutoDRIVE LIDAR measurements per scan
+N_LIDAR_OBS = 108  # downsampled beams to match sim training
 
 
 # ── Agent (must match training architecture) ──
@@ -48,11 +66,13 @@ agent.to(DEVICE).eval()
 obs_mean, obs_var = ckpt["obs_rms_mean"].numpy(), ckpt["obs_rms_var"].numpy()
 
 # ── Helpers ──
-LIDAR_IDX = np.linspace(0, 1080, 108, dtype=int)
+LIDAR_IDX = np.round(np.linspace(0, N_LIDAR_RAW - 1, N_LIDAR_OBS)).astype(int)
 prev_pos, prev_t, vel = None, None, 0.0
+current_steer = 0.0  # tracked steering angle [rad]
 
 
 def get_obs(f):
+    """Build the 110-d observation vector [108 lidar, velocity, steering]."""
     global prev_pos, prev_t, vel
     now = time.time()
     if prev_pos is not None and prev_t is not None:
@@ -60,12 +80,12 @@ def get_obs(f):
         if dt > 1e-6:
             vel = np.linalg.norm(f.position - prev_pos) / dt
     prev_pos, prev_t = f.position.copy(), now
-    obs = np.concatenate([f.lidar_range_array[LIDAR_IDX], [vel, f.steering]])
+    obs = np.concatenate([f.lidar_range_array[LIDAR_IDX], [vel, current_steer]])
     return np.clip((obs - obs_mean) / np.sqrt(obs_var + 1e-8), -10, 10)
 
 
 # ── AutoDrive bridge ──
-f1 = autodrive.F1TENTH()
+f1 = autodrive.RoboRacer()
 f1.id = "V1"
 sio = socketio.Server()
 app = Flask(__name__)
@@ -78,15 +98,34 @@ def connect(sid, environ):
 
 @sio.on("Bridge")
 def bridge(sid, data):
+    global current_steer, prev_t
     if not data:
         return
     f1.parse_data(data)
+
+    # Compute dt for steering integration
+    now = time.time()
+    dt = (now - prev_t) if prev_t is not None else 1.0 / 40.0  # default to LIDAR rate
+    dt = np.clip(dt, 1e-4, 0.1)  # safety clamp
+
     with torch.no_grad():
         act = agent(
             torch.tensor(get_obs(f1), device=DEVICE, dtype=torch.float32).unsqueeze(0)
         )
     a = act.cpu().numpy().flatten().clip(-1, 1)
-    f1.steering_command, f1.throttle_command = float(a[0]), (float(a[1]) + 1) / 2
+
+    # a[0] = d_steer ∈ [-1, 1] → steering velocity
+    # a[1] = torque   ∈ [-1, 1] → throttle command
+    d_steer = float(a[0])
+    torque = float(a[1])
+
+    # Integrate steering velocity to update tracked angle
+    sv = d_steer * STEER_VEL_MAX  # rad/s
+    current_steer = np.clip(current_steer + sv * dt, -STEER_MAX, STEER_MAX)
+
+    # Send to AutoDRIVE: steering_command in [-1, 1], throttle_command in [-1, 1]
+    f1.steering_command = current_steer / STEER_MAX  # normalize to [-1, 1]
+    f1.throttle_command = torque
     try:
         sio.emit("Bridge", data=f1.generate_commands())
     except Exception as e:
