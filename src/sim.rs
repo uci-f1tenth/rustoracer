@@ -78,7 +78,7 @@ impl Sim {
             buf_terminated: vec![false; n],
             buf_truncated: vec![false; n],
             buf_rewards: vec![0.0; n],
-            buf_scans: vec![0.0; n * (n_beams + 2)],
+            buf_scans: vec![0.0; n * (n_beams + 3)],
             buf_state: vec![0.0; n * 7],
         }
     }
@@ -132,7 +132,7 @@ impl Sim {
             .zip(self.cars.par_iter_mut())
             .zip(self.waypoint_idx.par_iter_mut())
             .zip(self.steps.par_iter_mut())
-            .zip(self.buf_scans.par_chunks_mut(n_beams + 2))
+            .zip(self.buf_scans.par_chunks_mut(n_beams + 3))
             .zip(self.buf_state.par_chunks_mut(7))
             .zip(self.rngs.par_iter_mut())
             .enumerate()
@@ -147,7 +147,7 @@ impl Sim {
                     if let Some(actions) = actions {
                         *step += 1;
                         for _ in 0..ds {
-                            car.step(actions[i * 2], actions[i * 2 + 1], dt / ds as f64);
+                            car.step(actions[i * 2], actions[i * 2 + 1], dt / (ds as f64));
                         }
                     }
 
@@ -170,7 +170,7 @@ impl Sim {
                         0.0
                     };
                     *reward = delta / n_wps as f64 * 100.0 * (1.0 + car.velocity.max(0.0) / 10.0)
-                        - 0.1 / map.edt(px, py).max(0.05)
+                        - 0.1 * (-3.0 * map.edt(px, py)).exp()
                         - 0.05 * d_steer_abs
                         - if *terminated { 100.0 } else { 0.0 };
 
@@ -194,15 +194,18 @@ impl Sim {
                     }
 
                     let (sin_h, cos_h) = car.theta.sin_cos();
+                    let lidar_x = car.x + car.params.lf * cos_h;
+                    let lidar_y = car.y + car.params.lf * sin_h;
                     for (j, &(sin_a, cos_a)) in beam_sin_cos.iter().enumerate() {
                         let dx = cos_h * cos_a - sin_h * sin_a;
                         let dy = sin_h * cos_a + cos_h * sin_a;
                         let noise = rng.random_range(-0.03_f64..=0.03);
-                        scan[j] = (map.raycast(car.x, car.y, dx, dy, max_range) + noise)
+                        scan[j] = (map.raycast(lidar_x, lidar_y, dx, dy, max_range) + noise)
                             .clamp(min_range, max_range);
                     }
                     scan[n_beams] = car.velocity;
                     scan[n_beams + 1] = car.steering;
+                    scan[n_beams + 2] = car.yaw_rate;
 
                     state[0] = car.x;
                     state[1] = car.y;

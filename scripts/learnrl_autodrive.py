@@ -34,7 +34,11 @@ We integrate d_steer into a tracked steering angle (matching the sim)
 and send it as a normalized steering command.
 """
 
-import time, numpy as np, torch, torch.nn as nn, socketio, eventlet
+import numpy as np
+import torch
+import torch.nn as nn
+import socketio
+import eventlet
 from flask import Flask
 import autodrive
 
@@ -47,7 +51,7 @@ N_LIDAR_OBS = 108  # downsampled beams to match sim training
 
 # ── Agent (must match training architecture) ──
 class Agent(nn.Module):
-    def __init__(self, obs=110, act=2, h=256):
+    def __init__(self, obs=111, act=2, h=256):
         super().__init__()
         self.actor_mean = nn.Sequential(
             nn.Linear(obs, h), nn.Tanh(), nn.Linear(h, h), nn.Tanh(), nn.Linear(h, act)
@@ -67,20 +71,23 @@ obs_mean, obs_var = ckpt["obs_rms_mean"].numpy(), ckpt["obs_rms_var"].numpy()
 
 # ── Helpers ──
 LIDAR_IDX = np.round(np.linspace(0, N_LIDAR_RAW - 1, N_LIDAR_OBS)).astype(int)
-prev_pos, prev_t, vel = None, None, 0.0
-current_steer = 0.0  # tracked steering angle [rad]
+current_steer = 0.0  # tracked steering angle [rad] (for command integration)
+NOMINAL_DT = 1.0 / 60.0  # fixed dt for steering integration [s]
 
 
 def get_obs(f):
-    """Build the 110-d observation vector [108 lidar, velocity, steering]."""
-    global prev_pos, prev_t, vel
-    now = time.time()
-    if prev_pos is not None and prev_t is not None:
-        dt = now - prev_t
-        if dt > 1e-6:
-            vel = np.linalg.norm(f.position - prev_pos) / dt
-    prev_pos, prev_t = f.position.copy(), now
-    obs = np.concatenate([f.lidar_range_array[LIDAR_IDX], [vel, current_steer]])
+    """Build the 111-d observation vector [108 lidar, velocity, steering, yaw_rate].
+
+    Uses AutoDRIVE-reported speed, steering feedback, and angular velocity
+    instead of noisy finite-difference estimates.
+    """
+    # Use the simulator-reported speed (clean) instead of finite-diff from position
+    vel = f.speed
+    # Use actual steering feedback (in [-1, 1]) converted to radians
+    steer_rad = f.steering * STEER_MAX
+    # Yaw rate from IMU angular velocity (Z-axis)
+    yaw_rate = f.angular_velocity[2]
+    obs = np.concatenate([f.lidar_range_array[LIDAR_IDX], [vel, steer_rad, yaw_rate]])
     return np.clip((obs - obs_mean) / np.sqrt(obs_var + 1e-8), -10, 10)
 
 
@@ -98,15 +105,10 @@ def connect(sid, environ):
 
 @sio.on("Bridge")
 def bridge(sid, data):
-    global current_steer, prev_t
+    global current_steer
     if not data:
         return
     f1.parse_data(data)
-
-    # Compute dt for steering integration
-    now = time.time()
-    dt = (now - prev_t) if prev_t is not None else 1.0 / 40.0  # default to LIDAR rate
-    dt = np.clip(dt, 1e-4, 0.1)  # safety clamp
 
     with torch.no_grad():
         act = agent(
@@ -117,11 +119,11 @@ def bridge(sid, data):
     # a[0] = d_steer ∈ [-1, 1] → steering velocity
     # a[1] = torque   ∈ [-1, 1] → throttle command
     d_steer = float(a[0])
-    torque = float(a[1])
+    torque = float(a[1]) * 0.03
 
-    # Integrate steering velocity to update tracked angle
+    # Integrate steering velocity with a fixed dt (matches sim's fixed-rate control)
     sv = d_steer * STEER_VEL_MAX  # rad/s
-    current_steer = np.clip(current_steer + sv * dt, -STEER_MAX, STEER_MAX)
+    current_steer = np.clip(current_steer + sv * NOMINAL_DT, -STEER_MAX, STEER_MAX)
 
     # Send to AutoDRIVE: steering_command in [-1, 1], throttle_command in [-1, 1]
     f1.steering_command = current_steer / STEER_MAX  # normalize to [-1, 1]

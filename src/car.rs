@@ -1,5 +1,6 @@
 use rand::RngExt;
 use rand::rngs::SmallRng;
+use std::f64::consts::PI;
 
 pub const G: f64 = 9.81;
 
@@ -337,6 +338,11 @@ impl CarParams {
         p.tire.p_dy1 *= mu_scale;
         p.tire.p_dx1 *= mu_scale;
 
+        // Scale tire stiffness (cornering + longitudinal)
+        let stiff_scale = rng.random_range(1.0 - frac..=1.0 + frac);
+        p.tire.p_ky1 *= stiff_scale;
+        p.tire.p_kx1 *= stiff_scale;
+
         p
     }
 
@@ -588,7 +594,7 @@ impl Car {
         self.y = y;
         self.steering = s.clamp(STEER_MIN, STEER_MAX);
         self.velocity = vx.clamp(V_MIN, V_MAX);
-        self.theta = yaw;
+        self.theta = (yaw + PI).rem_euclid(2.0 * PI) - PI;
         self.yaw_rate = yr;
         self.slip_angle = slip;
         self.omega_f = wf.max(0.0);

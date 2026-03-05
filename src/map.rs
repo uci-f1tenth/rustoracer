@@ -152,10 +152,10 @@ impl OccGrid {
                 return t;
             };
 
-            if d < self.res {
+            if d < self.res * 0.5 {
                 return t;
             }
-            t += d.max(self.res);
+            t += d.max(self.res * 0.5);
         }
         max
     }
@@ -190,8 +190,18 @@ impl OccGrid {
         if center_clearance * center_clearance > CAR_CIRCUMRADIUS_SQ {
             return false;
         }
-        self.car_pixels(car)
-            .into_iter()
-            .any(|(x, y)| self.edt(x, y) < self.res)
+
+        let (sa, ca) = car.theta.sin_cos();
+        let hl = LENGTH / 2.0;
+        let hw = WIDTH / 2.0;
+        for &(lx, ly) in &[(hl, hw), (hl, -hw), (-hl, hw), (-hl, -hw)] {
+            let wx = car.x + lx * ca - ly * sa;
+            let wy = car.y + lx * sa + ly * ca;
+            let (cpx, cpy) = self.position_to_pixels(wx, wy);
+            if self.edt(cpx, cpy) < self.res {
+                return true;
+            }
+        }
+        false
     }
 }
