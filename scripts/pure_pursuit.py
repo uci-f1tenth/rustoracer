@@ -9,7 +9,7 @@ WHEELBASE = 0.3302
 STEER_FACTOR = 1 / 0.4189
 SPEED = 3
 
-env = RustoracerEnv(yaml="maps/berlin.yaml", render_mode="human")
+env = RustoracerEnv(yaml="maps/my_map.yaml", render_mode="human")
 obs, info = env.reset()
 waypoints = env.skeleton.reshape(-1, 2)
 

@@ -48,7 +48,7 @@ else:
 # Parameters
 DRIVE_LIMIT = 1.0
 STEER_LIMIT = 1.0
-DRIVE_STEP_SIZE = 0.2
+DRIVE_STEP_SIZE = 0.05
 STEER_STEP_SIZE = 0.2
 
 # Information

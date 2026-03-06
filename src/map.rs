@@ -25,13 +25,12 @@ pub struct Skeleton {
 impl Skeleton {
     pub fn new(img: &GrayImage, res: f64, ox: f64, oy: f64, otheta: f64) -> Self {
         let mut ordered_skeleton = extract_main_loop(&mut thin_image_edges(img), res, ox, oy);
-        if ordered_skeleton.len() >= 2 {
-            let dy = ordered_skeleton[1][1] - ordered_skeleton[0][1];
-            let dx = ordered_skeleton[1][0] - ordered_skeleton[0][0];
-            let diff = (dy.atan2(dx) - otheta + 3.0 * PI) % (2.0 * PI) - PI;
-            if diff.abs() > std::f64::consts::FRAC_PI_2 {
-                ordered_skeleton[1..].reverse();
-            }
+        assert!(ordered_skeleton.len() >= 2);
+        let dy = ordered_skeleton[1][1] - ordered_skeleton[0][1];
+        let dx = ordered_skeleton[1][0] - ordered_skeleton[0][0];
+        let diff = (dy.atan2(dx) - otheta + 3.0 * PI) % (2.0 * PI) - PI;
+        if diff.abs() > std::f64::consts::FRAC_PI_2 {
+            ordered_skeleton[1..].reverse();
         }
         let skeleton_tree = ImmutableKdTree::new_from_slice(&ordered_skeleton);
         let skeleton_lut: Vec<usize> =
