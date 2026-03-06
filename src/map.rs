@@ -27,6 +27,9 @@ impl Skeleton {
         let mut skeleton = thin_image_edges(img);
         #[cfg(feature = "show_images")]
         view_image(&skeleton, "skeleton");
+        #[cfg(feature = "show_images")]
+        std::thread::sleep(std::time::Duration::from_secs(10));
+
         let mut ordered_skeleton = extract_main_loop(&mut skeleton, res, ox, oy);
         assert!(ordered_skeleton.len() >= 2);
         let dy = ordered_skeleton[1][1] - ordered_skeleton[0][1];
@@ -103,19 +106,17 @@ impl OccGrid {
         let img = image::open(dir.join(&m.image)).unwrap().into_luma8();
         let mut occupied_image = img.clone();
         for pixel in occupied_image.pixels_mut() {
-            pixel.0[0] = if pixel.0[0] < 250 { 255 } else { 0 };
+            pixel.0[0] = if pixel.0[0] < 128 { 255 } else { 0 };
         }
         let edt = euclidean_squared_distance_transform(&occupied_image);
         #[cfg(feature = "show_images")]
         view_image(&occupied_image, "occupied");
+        let edt_img = GrayImage::from_fn(img.width(), img.height(), |x, y| {
+            let val = edt.get_pixel(x, y).0[0].sqrt();
+            image::Luma([(val.min(255.0)) as u8])
+        });
         #[cfg(feature = "show_images")]
-        {
-            let edt_img = GrayImage::from_fn(img.width(), img.height(), |x, y| {
-                let val = edt.get_pixel(x, y).0[0].sqrt();
-                image::Luma([(val.min(255.0)) as u8])
-            });
-            view_image(&edt_img, "edt");
-        }
+        view_image(&edt_img, "edt");
 
         Self {
             inv_res: 1.0 / m.resolution,

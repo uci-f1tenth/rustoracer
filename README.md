@@ -52,6 +52,10 @@ colcon build
 source install/setup.bash
 ros2 launch wall_follow wall_follow.launch.py
 ```
+## Keyboard control
+```bash
+python3 scripts/autodrive_devkit/autodrive_roboracer/teleop_keyboard.py
+```
 ## Save map
 ```bash
 ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap "{name: {data: '/workspaces/rustoracer/my_map'}}"
