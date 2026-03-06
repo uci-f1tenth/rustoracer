@@ -106,10 +106,8 @@ impl Sim {
                 omega_r: 0.0,
                 params: CarParams::random(&mut self.rngs[i], self.dr_frac),
             };
+            self.waypoint_idx[i] = ri;
         }
-        let (px, py) = self.map.position_to_pixels(0.0, 0.0);
-        let nearest = self.map.skeleton.get_idx(px, py);
-        self.waypoint_idx.fill(nearest);
         self.observe()
     }
 
@@ -144,11 +142,13 @@ impl Sim {
                         rng,
                     ),
                 )| {
+                    let mut d_steer_abs = 0.0;
                     if let Some(actions) = actions {
                         *step += 1;
                         for _ in 0..ds {
                             car.step(actions[i * 2], actions[i * 2 + 1], dt / (ds as f64));
                         }
+                        d_steer_abs = actions[i * 2].abs();
                     }
 
                     *terminated = map.car_collides(car);
@@ -164,14 +164,10 @@ impl Sim {
                     } else if delta < -(n_wps as f64 / 2.0) {
                         delta += n_wps as f64;
                     }
-                    let d_steer_abs = if let Some(actions) = actions {
-                        actions[i * 2].abs()
-                    } else {
-                        0.0
-                    };
+
                     *reward = delta / n_wps as f64 * 100.0 * (1.0 + car.velocity.max(0.0) / 10.0)
                         - 0.1 * (-3.0 * map.edt(px, py)).exp()
-                        - 0.05 * d_steer_abs
+                        - 0.05 * d_steer_abs * d_steer_abs
                         - if *terminated { 100.0 } else { 0.0 };
 
                     if *terminated || *truncated {

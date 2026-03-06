@@ -26,7 +26,7 @@ class RustoracerEnv(gym.vector.VectorEnv):
         self._sim: PySim = PySim(yaml, num_envs, max_steps)
 
         single_obs_space = spaces.Box(
-            np.array([0.0] * self._sim.n_beams + [-5.0, -0.5, -10.0]),
+            np.array([self._sim.min_range] * self._sim.n_beams + [-5.0, -0.5, -10.0]),
             np.array([self._sim.max_range] * self._sim.n_beams + [20.0, 0.5, 10.0]),
             dtype=np.float64,
         )

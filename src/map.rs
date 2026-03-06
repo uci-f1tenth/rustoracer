@@ -191,17 +191,7 @@ impl OccGrid {
             return false;
         }
 
-        let (sa, ca) = car.theta.sin_cos();
-        let hl = LENGTH / 2.0;
-        let hw = WIDTH / 2.0;
-        for &(lx, ly) in &[(hl, hw), (hl, -hw), (-hl, hw), (-hl, -hw)] {
-            let wx = car.x + lx * ca - ly * sa;
-            let wy = car.y + lx * sa + ly * ca;
-            let (cpx, cpy) = self.position_to_pixels(wx, wy);
-            if self.edt(cpx, cpy) < self.res {
-                return true;
-            }
-        }
-        false
+        self.car_pixels(car)
+            .any(|(px, py)| self.edt(px, py) < self.res)
     }
 }
