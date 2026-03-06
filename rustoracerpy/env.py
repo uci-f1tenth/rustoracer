@@ -41,8 +41,8 @@ class RustoracerEnv(gym.vector.VectorEnv):
 
         self.skeleton: NDArray[np.float64] = self._sim.skeleton
 
-        self._last_scans = None
-        self._last_states = None
+        self._last_scans = []
+        self._last_states = []
         if render_mode == "human":
             rr.init("simple_image_display", spawn=True)
 
@@ -106,6 +106,3 @@ class RustoracerEnv(gym.vector.VectorEnv):
             )
         elif self.render_mode == "rgb_array":
             return self._sim.render()
-
-    def close(self) -> None:
-        pass
