@@ -24,7 +24,10 @@ pub struct Skeleton {
 
 impl Skeleton {
     pub fn new(img: &GrayImage, res: f64, ox: f64, oy: f64, otheta: f64) -> Self {
-        let mut ordered_skeleton = extract_main_loop(&mut thin_image_edges(img), res, ox, oy);
+        let mut skeleton = thin_image_edges(img);
+        #[cfg(feature = "show_images")]
+        view_image(&skeleton, "skeleton");
+        let mut ordered_skeleton = extract_main_loop(&mut skeleton, res, ox, oy);
         assert!(ordered_skeleton.len() >= 2);
         let dy = ordered_skeleton[1][1] - ordered_skeleton[0][1];
         let dx = ordered_skeleton[1][0] - ordered_skeleton[0][0];
@@ -83,6 +86,16 @@ pub struct OccGrid {
     pub oy: f64,
 }
 
+#[cfg(feature = "show_images")]
+fn view_image(img: &GrayImage, title: &str) {
+    let window = show_image::create_window(title, Default::default()).unwrap();
+    let image_view = show_image::ImageView::new(
+        show_image::ImageInfo::mono8(img.width(), img.height()),
+        img.as_raw(),
+    );
+    window.set_image(title, image_view).unwrap();
+}
+
 impl OccGrid {
     pub fn load(yaml: &str) -> Self {
         let m: MapMeta = serde_saphyr::from_str(&std::fs::read_to_string(yaml).unwrap()).unwrap();
@@ -93,6 +106,17 @@ impl OccGrid {
             pixel.0[0] = if pixel.0[0] < 250 { 255 } else { 0 };
         }
         let edt = euclidean_squared_distance_transform(&occupied_image);
+        #[cfg(feature = "show_images")]
+        view_image(&occupied_image, "occupied");
+        #[cfg(feature = "show_images")]
+        {
+            let edt_img = GrayImage::from_fn(img.width(), img.height(), |x, y| {
+                let val = edt.get_pixel(x, y).0[0].sqrt();
+                image::Luma([(val.min(255.0)) as u8])
+            });
+            view_image(&edt_img, "edt");
+        }
+
         Self {
             inv_res: 1.0 / m.resolution,
             img,
