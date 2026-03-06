@@ -66,6 +66,19 @@ class RustoracerEnv(gym.vector.VectorEnv):
             {"state": states.reshape(self.num_envs, -1)},
         )
 
+    def easy_step(self, actions):
+        scans, rewards, terminated, truncated, states = self._sim.easy_step(
+            actions.ravel()
+        )
+        self._last_scans, self._last_states = scans, states
+        return (
+            scans.reshape(self.num_envs, -1),
+            rewards,
+            terminated,
+            truncated,
+            {"state": states.reshape(self.num_envs, -1)},
+        )
+
     def render(self):
         if self.render_mode == "human":
             img = self._sim.render()

@@ -47,6 +47,42 @@ mod rustoracer {
             )
         }
 
+        fn easy_step<'py>(
+            &mut self,
+            py: Python<'py>,
+            actions: PyReadonlyArray1<f64>,
+        ) -> (
+            Bound<'py, PyArray1<f64>>,
+            Bound<'py, PyArray1<f64>>,
+            Bound<'py, PyArray1<bool>>,
+            Bound<'py, PyArray1<bool>>,
+            Bound<'py, PyArray1<f64>>,
+        ) {
+            let transformed: Vec<f64> = actions
+                .as_slice()
+                .unwrap()
+                .chunks(2)
+                .enumerate()
+                .flat_map(|(i, chunk)| {
+                    let steer = chunk[0];
+                    let speed = chunk[1];
+                    let current_steer = self.sim.cars[i].steering;
+                    let current_speed = self.sim.cars[i].velocity;
+                    let steer_command = if steer > current_steer { 1.0 } else { -1.0 };
+                    let speed_command = if speed > current_speed { 1.0 } else { -1.0 };
+                    [steer_command, speed_command]
+                })
+                .collect();
+            let o = self.sim.step(transformed.as_ref());
+            (
+                o.scans.to_pyarray(py),
+                o.rewards.to_pyarray(py),
+                o.terminated.to_pyarray(py),
+                o.truncated.to_pyarray(py),
+                o.state.to_pyarray(py),
+            )
+        }
+
         fn step<'py>(
             &mut self,
             py: Python<'py>,

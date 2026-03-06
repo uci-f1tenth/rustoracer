@@ -7,12 +7,11 @@ from rustoracerpy import RustoracerEnv
 LOOKAHEAD = 1.5
 WHEELBASE = 0.3302
 STEER_FACTOR = 1 / 0.4189
-SPEED = -0.6
+SPEED = 3
 
 env = RustoracerEnv(yaml="maps/berlin.yaml", render_mode="human")
 obs, info = env.reset()
 waypoints = env.skeleton.reshape(-1, 2)
-
 
 try:
     while True:
@@ -42,13 +41,13 @@ try:
             else 0.0
         )
 
-        obs, reward, terminated, truncated, info = env.step(np.array([[steer, SPEED]]))
+        obs, reward, terminated, truncated, info = env.easy_step(
+            np.array([[steer, SPEED]])
+        )
         env.render()
         elapsed = time.perf_counter() - loop_start
         time.sleep(max(0.0, 1.0 / 60.0 - elapsed))
 
-        if terminated[0] or truncated[0]:
-            obs, info = env.reset()
 except KeyboardInterrupt:
     pass
 finally:
