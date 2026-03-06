@@ -91,7 +91,7 @@ impl OccGrid {
         let img = image::open(dir.join(&m.image)).unwrap().into_luma8();
         let mut occupied_image = img.clone();
         for pixel in occupied_image.pixels_mut() {
-            pixel.0[0] = if pixel.0[0] < 128 { 255 } else { 0 };
+            pixel.0[0] = if pixel.0[0] < 250 { 255 } else { 0 };
         }
         let edt = euclidean_squared_distance_transform(&occupied_image);
         Self {
