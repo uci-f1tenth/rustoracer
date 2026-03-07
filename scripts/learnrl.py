@@ -3,7 +3,6 @@ from __future__ import annotations
 import math
 import os
 import random
-import threading
 import time
 from dataclasses import dataclass
 from typing import Tuple
@@ -254,37 +253,6 @@ def record_eval_video(
         return None, total_reward
     video_np = np.stack(frames).transpose(0, 3, 1, 2)
     return wandb.Video(video_np, fps=60, format="mp4"), total_reward
-
-
-def _video_thread_fn(
-    yaml: str,
-    agent_snapshot: Agent,
-    obs_rms_cpu: CPURunningMeanStd,
-    device: torch.device,
-    max_steps: int,
-    max_ep_steps: int,
-    update: int,
-    global_step: int,
-) -> None:
-    """Background thread: record eval video with a frozen agent snapshot and log to wandb."""
-    try:
-        vid, eval_reward = record_eval_video(
-            yaml=yaml,
-            agent=agent_snapshot,
-            obs_rms_cpu=obs_rms_cpu,
-            device=device,
-            max_steps=max_steps,
-            max_ep_steps=max_ep_steps,
-        )
-        log_dict: dict = {"charts/eval_return": eval_reward}
-        if vid is not None:
-            log_dict["media/eval_video"] = vid
-            print(f"[iter {update}] Video captured (bg), eval_return={eval_reward:.2f}")
-        else:
-            print(f"[iter {update}] WARNING: no frames captured! (bg)")
-        wandb.log(log_dict, step=global_step)
-    except Exception as e:
-        print(f"[iter {update}] Video thread error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -550,9 +518,6 @@ if __name__ == "__main__":
     else:
         video_iters = set()
 
-    # ── background video thread tracking ─────────────────────────
-    video_thread: threading.Thread | None = None
-
     pbar = tqdm.tqdm(range(1, args.num_iterations + 1))
 
     # ═══════════════════  outer loop  ════════════════════════════
@@ -698,40 +663,25 @@ if __name__ == "__main__":
             "perf/global_step": global_step,
         }
 
-        # ── video (background thread) ───────────────────────────
+        # ── video ────────────────────────────────────────────────
         if update in video_iters:
-            # Wait for any previous video thread to finish before starting a new one
-            if video_thread is not None and video_thread.is_alive():
-                print(f"[iter {update}] Waiting for previous video thread to finish...")
-                video_thread.join()
-
-            print(f"\n[iter {update}] Spawning background video recording thread...")
-
-            # Snapshot agent weights so the bg thread doesn't race with training.
-            # Build a fresh Agent on the same device with cloned parameters.
-            agent_snapshot = Agent(obs_dim, act_dim, args.hidden).to(device)
-            agent_snapshot.load_state_dict(
-                {k: v.clone() for k, v in agent.state_dict().items()}
-            )
-            agent_snapshot.eval()
-
+            print(f"\n[iter {update}] Recording eval video...")
             obs_rms_cpu = gpu_rms_to_cpu(obs_rms)
-
-            video_thread = threading.Thread(
-                target=_video_thread_fn,
-                kwargs=dict(
-                    yaml=args.yaml,
-                    agent_snapshot=agent_snapshot,
-                    obs_rms_cpu=obs_rms_cpu,
-                    device=device,
-                    max_steps=args.video_max_steps,
-                    max_ep_steps=args.max_ep_steps,
-                    update=update,
-                    global_step=global_step,
-                ),
-                daemon=True,
+            vid, eval_reward = record_eval_video(
+                yaml=args.yaml,
+                agent=agent,
+                obs_rms_cpu=obs_rms_cpu,
+                device=device,
+                max_steps=args.video_max_steps,
+                max_ep_steps=args.max_ep_steps,
             )
-            video_thread.start()
+            eval_log: dict = {"charts/eval_return": eval_reward}
+            if vid is not None:
+                eval_log["media/eval_video"] = vid
+                print(f"[iter {update}] Video captured, eval_return={eval_reward:.2f}")
+            else:
+                print(f"[iter {update}] WARNING: no frames captured!")
+            wandb.log(eval_log, step=global_step)
 
         wandb.log(log_dict, step=global_step)
 
@@ -753,11 +703,6 @@ if __name__ == "__main__":
             save_checkpoint(
                 args, agent, optimizer, obs_rms, ret_rms, global_step, update
             )
-
-    # ── wait for any in-flight video thread before final save ────
-    if video_thread is not None and video_thread.is_alive():
-        print("Waiting for final video thread to finish...")
-        video_thread.join()
 
     # ── final save ───────────────────────────────────────────────
     save_checkpoint(
