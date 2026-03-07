@@ -36,7 +36,7 @@ class Args:
     """whether to capture videos of the agent performances"""
 
     # Algorithm specific arguments
-    yaml: str = "maps/berlin.yaml"
+    yaml: str = "maps/my_map.yaml"
     """path to the RustoracerEnv YAML map file"""
     total_timesteps: int = 50_000_000
     """total timesteps of the experiments"""
@@ -87,7 +87,7 @@ class Args:
 
     video_interval: int = 25
     """record an evaluation video every N iterations (0 to disable)"""
-    video_max_steps: int = 600
+    video_max_steps: int = 3_600
     """max steps per evaluation video episode"""
 
     save_interval: int = 50
