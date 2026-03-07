@@ -13,7 +13,6 @@ imageproc = "0.26.0"
 rayon = "1.11.0"
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = "0.0.21"
-show-image = { version = "=0.14.0", optional = true }
 r2r = { version = "0.9.0", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 futures = { version = "0.3", optional = true }
@@ -26,7 +25,6 @@ kiddo = "5.2.4"
 [features]
 ros = ["dep:r2r", "dep:tokio", "dep:futures"]
 python = ["dep:pyo3", "dep:numpy"]
-show_images = ["dep:show-image"]
 
 [profile.profiling]
 inherits = "release"

@@ -1,13 +1,30 @@
 use std::f64::consts::PI;
 
 use crate::car::{Car, LENGTH, WIDTH};
-use crate::skeleton::{extract_main_loop, thin_image_edges};
+use crate::skeleton::{
+    extract_main_loop, morphological_open, savitzky_golay_smooth, thin_image_edges,
+};
 use image::GrayImage;
 use imageproc::distance_transform::euclidean_squared_distance_transform;
 use kiddo::SquaredEuclidean;
 use kiddo::immutable::float::kdtree::ImmutableKdTree;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::Deserialize;
+pub struct SkeletonConfig {
+    pub open_radius: u32,
+    pub sg_window: usize,
+    pub sg_degree: usize,
+}
+
+impl Default for SkeletonConfig {
+    fn default() -> Self {
+        Self {
+            open_radius: 2,
+            sg_window: 11,
+            sg_degree: 3,
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct MapMeta {
@@ -23,32 +40,37 @@ pub struct Skeleton {
 }
 
 impl Skeleton {
-    pub fn new(img: &GrayImage, res: f64, ox: f64, oy: f64, otheta: f64) -> Self {
-        let mut skeleton = thin_image_edges(img);
-        #[cfg(feature = "show_images")]
-        view_image(&skeleton, "skeleton");
-        #[cfg(feature = "show_images")]
-        std::thread::sleep(std::time::Duration::from_secs(10));
+    pub fn new(
+        img: &GrayImage,
+        res: f64,
+        ox: f64,
+        oy: f64,
+        otheta: f64,
+        cfg: &SkeletonConfig,
+    ) -> Self {
+        let mut thinned = thin_image_edges(img);
+        let mut ordered = extract_main_loop(&mut thinned, res, ox, oy);
+        assert!(ordered.len() >= 2);
 
-        let mut ordered_skeleton = extract_main_loop(&mut skeleton, res, ox, oy);
-        assert!(ordered_skeleton.len() >= 2);
-        let dy = ordered_skeleton[1][1] - ordered_skeleton[0][1];
-        let dx = ordered_skeleton[1][0] - ordered_skeleton[0][0];
+        let dy = ordered[1][1] - ordered[0][1];
+        let dx = ordered[1][0] - ordered[0][0];
         let diff = (dy.atan2(dx) - otheta + 3.0 * PI) % (2.0 * PI) - PI;
-        if diff.abs() > std::f64::consts::FRAC_PI_2 {
-            ordered_skeleton[1..].reverse();
+        if diff.abs() > PI / 2.0 {
+            ordered[1..].reverse();
         }
-        let skeleton_tree = ImmutableKdTree::new_from_slice(&ordered_skeleton);
-        let skeleton_lut: Vec<usize> =
-            Self::build_skeleton_lut(&skeleton_tree, img.width(), img.height(), res, ox, oy);
+
+        let smoothed = savitzky_golay_smooth(&ordered, cfg.sg_window, cfg.sg_degree);
+        let tree = ImmutableKdTree::new_from_slice(&smoothed);
+        let lut = Self::build_lut(&tree, img.width(), img.height(), res, ox, oy);
+
         Self {
-            points: ordered_skeleton,
-            lut: skeleton_lut,
+            points: smoothed,
+            lut,
             width: img.width(),
         }
     }
 
-    fn build_skeleton_lut(
+    fn build_lut(
         tree: &ImmutableKdTree<f64, usize, 2, 32>,
         w: u32,
         h: u32,
@@ -70,12 +92,16 @@ impl Skeleton {
 
     pub fn get_point(&self, idx: usize) -> (f64, f64, f64) {
         let [px, py] = self.points[idx];
-        let [nxt_px, nxt_py] = self.points[(idx + 1) % self.points.len()];
-        (px, py, (nxt_py - py).atan2(nxt_px - px))
+        let [nx, ny] = self.points[(idx + 1) % self.points.len()];
+        (px, py, (ny - py).atan2(nx - px))
     }
 
     pub fn get_idx(&self, px: u32, py: u32) -> usize {
         self.lut[(py * self.width + px) as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.points.len()
     }
 }
 
@@ -89,46 +115,40 @@ pub struct OccGrid {
     pub oy: f64,
 }
 
-#[cfg(feature = "show_images")]
-fn view_image(img: &GrayImage, title: &str) {
-    let window = show_image::create_window(title, Default::default()).unwrap();
-    let image_view = show_image::ImageView::new(
-        show_image::ImageInfo::mono8(img.width(), img.height()),
-        img.as_raw(),
-    );
-    window.set_image(title, image_view).unwrap();
-}
-
 impl OccGrid {
     pub fn load(yaml: &str) -> Self {
+        Self::load_with_config(yaml, &SkeletonConfig::default())
+    }
+
+    pub fn load_with_config(yaml: &str, cfg: &SkeletonConfig) -> Self {
         let m: MapMeta = serde_saphyr::from_str(&std::fs::read_to_string(yaml).unwrap()).unwrap();
         let dir = std::path::Path::new(yaml).parent().unwrap();
         let img = image::open(dir.join(&m.image)).unwrap().into_luma8();
-        let mut occupied_image = img.clone();
-        for pixel in occupied_image.pixels_mut() {
-            pixel.0[0] = if pixel.0[0] < 128 { 255 } else { 0 };
+
+        let mut binary = img.clone();
+        for p in binary.pixels_mut() {
+            p.0[0] = if p.0[0] < 210 { 255 } else { 0 };
         }
-        let edt = euclidean_squared_distance_transform(&occupied_image);
-        #[cfg(feature = "show_images")]
-        view_image(&occupied_image, "occupied");
-        let edt_img = GrayImage::from_fn(img.width(), img.height(), |x, y| {
-            let val = edt.get_pixel(x, y).0[0].sqrt();
-            image::Luma([(val.min(255.0)) as u8])
-        });
-        #[cfg(feature = "show_images")]
-        view_image(&edt_img, "edt");
+
+        let edt_raw = euclidean_squared_distance_transform(&binary);
+        let opened = morphological_open(&binary, cfg.open_radius);
+        let skeleton = Skeleton::new(
+            &opened,
+            m.resolution,
+            m.origin[0],
+            m.origin[1],
+            m.origin[2],
+            cfg,
+        );
 
         Self {
             inv_res: 1.0 / m.resolution,
             img,
-            edt: edt.pixels().map(|p| p.0[0].sqrt() * m.resolution).collect(),
-            skeleton: Skeleton::new(
-                &occupied_image,
-                m.resolution,
-                m.origin[0],
-                m.origin[1],
-                m.origin[2],
-            ),
+            edt: edt_raw
+                .pixels()
+                .map(|p| p.0[0].sqrt() * m.resolution)
+                .collect(),
+            skeleton,
             res: m.resolution,
             ox: m.origin[0],
             oy: m.origin[1],
@@ -159,23 +179,16 @@ impl OccGrid {
     pub fn raycast(&self, x: f64, y: f64, dx: f64, dy: f64, max: f64) -> f64 {
         let px0 = (x - self.ox) * self.inv_res;
         let py0 = (self.img.height() - 1) as f64 - (y - self.oy) * self.inv_res;
-        let dpx = dx * self.inv_res;
-        let dpy = -dy * self.inv_res;
-
-        let w = self.img.width();
-        let h = self.img.height();
-
+        let (dpx, dpy) = (dx * self.inv_res, -dy * self.inv_res);
+        let (w, h) = (self.img.width(), self.img.height());
         let mut t = 0.0;
         while t < max {
-            let pxi = (px0 + t * dpx) as u32;
-            let pyi = (py0 + t * dpy) as u32;
-
+            let (pxi, pyi) = ((px0 + t * dpx) as u32, (py0 + t * dpy) as u32);
             let d = if pxi < w && pyi < h {
                 unsafe { *self.edt.get_unchecked((pxi + pyi * w) as usize) }
             } else {
                 return t;
             };
-
             if d < self.res * 0.5 {
                 return t;
             }
@@ -189,15 +202,11 @@ impl OccGrid {
         let (hl, hw) = (LENGTH / 2.0 * self.inv_res, WIDTH / 2.0 * self.inv_res);
         let (cx, cy) = self.position_to_pixels(car.x, car.y);
         let r = hl.hypot(hw).ceil() as i32;
-
         (-r..=r).flat_map(move |dy| {
             (-r..=r).filter_map(move |dx| {
                 let (fx, fy) = (dx as f64, dy as f64);
-                if (fx * ca - fy * sa).abs() <= hl && (fx * sa + fy * ca).abs() <= hw {
-                    Some(((cx as i32 + dx) as u32, (cy as i32 + dy) as u32))
-                } else {
-                    None
-                }
+                ((fx * ca - fy * sa).abs() <= hl && (fx * sa + fy * ca).abs() <= hw)
+                    .then_some(((cx as i32 + dx) as u32, (cy as i32 + dy) as u32))
             })
         })
     }
@@ -207,14 +216,11 @@ impl OccGrid {
             return true;
         }
         let (px, py) = self.position_to_pixels(car.x, car.y);
-        let center_clearance = self.edt(px, py);
-        const CAR_CIRCUMRADIUS_SQ: f64 =
-            (LENGTH / 2.0) * (LENGTH / 2.0) + (WIDTH / 2.0) * (WIDTH / 2.0);
-
-        if center_clearance * center_clearance > CAR_CIRCUMRADIUS_SQ {
+        const R_SQ: f64 = (LENGTH / 2.0) * (LENGTH / 2.0) + (WIDTH / 2.0) * (WIDTH / 2.0);
+        let c = self.edt(px, py);
+        if c * c > R_SQ {
             return false;
         }
-
         self.car_pixels(car)
             .any(|(px, py)| self.edt(px, py) < self.res)
     }

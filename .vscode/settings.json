@@ -1,6 +1,5 @@
 {
     "rust-analyzer.cargo.features": [
         "python",
-        "show_images"
     ]
 }
