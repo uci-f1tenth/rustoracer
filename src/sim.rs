@@ -192,9 +192,12 @@ impl Sim {
                     for (j, &(sin_a, cos_a)) in beam_sin_cos.iter().enumerate() {
                         let dx = cos_h * cos_a - sin_h * sin_a;
                         let dy = sin_h * cos_a + cos_h * sin_a;
-                        let noise = rng.random_range(-0.03_f64..=0.03);
-                        scan[j] = (map.raycast(lidar_x, lidar_y, dx, dy, max_range) + noise)
-                            .clamp(min_range, max_range);
+                        // let noise = rng.random_range(-0.03_f64..=0.03);
+                        scan[j] = (
+                            map.raycast(lidar_x, lidar_y, dx, dy, min_range, max_range)
+                            // + noise
+                        )
+                        .clamp(min_range, max_range);
                     }
                     scan[n_beams] = car.velocity;
                     scan[n_beams + 1] = car.steering;

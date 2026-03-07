@@ -41,8 +41,6 @@ class RustoracerEnv(gym.vector.VectorEnv):
 
         self.skeleton: NDArray[np.float64] = self._sim.skeleton
 
-        self._last_scans = []
-        self._last_states = []
         if render_mode == "human":
             rr.init("simple_image_display", spawn=True)
 
@@ -50,14 +48,12 @@ class RustoracerEnv(gym.vector.VectorEnv):
         if seed is not None:
             self._sim.seed(seed)
         scans, _r, _t, _tr, states = self._sim.reset()
-        self._last_scans, self._last_states = scans, states
         return scans.reshape(self.num_envs, -1), {
             "state": states.reshape(self.num_envs, -1)
         }
 
     def step(self, actions):
         scans, rewards, terminated, truncated, states = self._sim.step(actions.ravel())
-        self._last_scans, self._last_states = scans, states
         return (
             scans.reshape(self.num_envs, -1),
             rewards,
@@ -70,7 +66,6 @@ class RustoracerEnv(gym.vector.VectorEnv):
         scans, rewards, terminated, truncated, states = self._sim.easy_step(
             actions.ravel()
         )
-        self._last_scans, self._last_states = scans, states
         return (
             scans.reshape(self.num_envs, -1),
             rewards,
@@ -84,22 +79,22 @@ class RustoracerEnv(gym.vector.VectorEnv):
             img = self._sim.render()
             rr.log("world/image", rr.Image(img))
 
+            scans, rewards, terminated, truncated, state = self._sim.observe()
+
             sk_px = self._sim.world_to_pixels(self.skeleton).reshape(-1, 2)
             rr.log("world/centerline", rr.LineStrips2D([sk_px]))
 
-            if self._last_scans is not None:
-                s = self._last_states
-                sc = self._last_scans[: self._sim.n_beams]
-                angles = s[2] + np.linspace(
-                    -self._sim.fov / 2, self._sim.fov / 2, self._sim.n_beams
-                )
-                ends = np.c_[s[0] + sc * np.cos(angles), s[1] + sc * np.sin(angles)]
-                org = np.broadcast_to([[s[0], s[1]]], ends.shape)
-                ends_px = self._sim.world_to_pixels(ends.ravel()).reshape(-1, 2)
-                org_px = self._sim.world_to_pixels(org.ravel()).reshape(-1, 2)
-                rr.log(
-                    "world/lidar", rr.LineStrips2D(np.stack([org_px, ends_px], axis=1))
-                )
+            angles = state[2] + np.linspace(
+                -self._sim.fov / 2, self._sim.fov / 2, self._sim.n_beams
+            )
+            ends = np.c_[
+                state[0] + scans[: self._sim.n_beams] * np.cos(angles),
+                state[1] + scans[: self._sim.n_beams] * np.sin(angles),
+            ]
+            org = np.broadcast_to([[state[0], state[1]]], ends.shape)
+            ends_px = self._sim.world_to_pixels(ends.ravel()).reshape(-1, 2)
+            org_px = self._sim.world_to_pixels(org.ravel()).reshape(-1, 2)
+            rr.log("world/lidar", rr.LineStrips2D(np.stack([org_px, ends_px], axis=1)))
             car_px = self._sim.car_pixels().reshape(-1, 2)
             rr.log(
                 "world/car", rr.Points2D(car_px, colors=[[43, 127, 255]], radii=[1.0])

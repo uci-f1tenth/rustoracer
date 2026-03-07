@@ -38,7 +38,7 @@ class Args:
     # Algorithm specific arguments
     yaml: str = "maps/my_map.yaml"
     """path to the RustoracerEnv YAML map file"""
-    total_timesteps: int = 50_000_000
+    total_timesteps: int = 200_000_000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""

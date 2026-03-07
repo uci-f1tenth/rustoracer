@@ -176,12 +176,12 @@ impl OccGrid {
     }
 
     #[inline]
-    pub fn raycast(&self, x: f64, y: f64, dx: f64, dy: f64, max: f64) -> f64 {
+    pub fn raycast(&self, x: f64, y: f64, dx: f64, dy: f64, min: f64, max: f64) -> f64 {
         let px0 = (x - self.ox) * self.inv_res;
         let py0 = (self.img.height() - 1) as f64 - (y - self.oy) * self.inv_res;
         let (dpx, dpy) = (dx * self.inv_res, -dy * self.inv_res);
         let (w, h) = (self.img.width(), self.img.height());
-        let mut t = 0.0;
+        let mut t = min;
         while t < max {
             let (pxi, pyi) = ((px0 + t * dpx) as u32, (py0 + t * dpy) as u32);
             let d = if pxi < w && pyi < h {
