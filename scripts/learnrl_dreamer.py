@@ -28,12 +28,12 @@ print(f"Using Dreamer code from: {sys.path[-1]}")
 import tools
 import models
 
-print("="*50)
+print("-"*50)
 print(f"PyTorch Version: {torch.__version__}")
 print(f"CUDA Available:  {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"GPU Device:      {torch.cuda.get_device_name(0)}")
-print("="*50)
+print("-"*50)
 
 if not torch.cuda.is_available():
     print("FATAL ERROR: PyTorch installed without CUDA support.")
@@ -51,7 +51,7 @@ class Args:
 
     # Environment
     yaml_map: str = "maps/berlin.yaml" 
-    total_timesteps: int = 5_000_000
+    total_timesteps: int = 10_000_000
     num_envs: int = 1024
     max_ep_steps: int = 10_000
     
@@ -67,7 +67,7 @@ class Args:
     
     # Logging
     video_interval: int = 25
-    video_max_steps: int = 600
+    video_max_steps: int = 500
 
 # ━━━━━━━━━━━━━━━━━━━━  Vectorized Buffer  ━━━━━━━━━━━━━━━━━━━━━━━
 class VectorizedReplayBuffer:
@@ -143,7 +143,7 @@ def record_eval_video(yaml_map: str, wm: models.WorldModel, behavior: models.Ima
         feat = wm.dynamics.get_feat(agent_state)
         action = behavior.actor(feat).mode() 
         
-        raw_obs, reward, term, trunc, _ = eval_env.step(action.cpu().numpy().clip(-1.0, 1.0))
+        raw_obs, reward, term, trunc, _ = eval_env.step(action.cpu().numpy().astype(np.float64).clip(-1.0, 1.0))
         total_reward += float(reward[0])
         is_first = torch.tensor(term | trunc, dtype=torch.bool, device=device)
         
@@ -212,7 +212,7 @@ if __name__ == "__main__":
     prefill_iters = max(1, args.prefill_steps // args.num_envs)
     print(f"Prefilling buffer with random actions ({prefill_iters} steps per env)...")
     for _ in range(prefill_iters):
-        action_np = np.random.uniform(-1.0, 1.0, size=(args.num_envs, act_dim)).astype(np.float32)
+        action_np = np.random.uniform(-1.0, 1.0, size=(args.num_envs, act_dim)).astype(np.float64)
         obs_np, reward_np, term_np, trunc_np, _ = env.step(action_np)
         done_np = term_np | trunc_np
         buffer.add(next_obs_np, action_np, reward_np, done_np, is_first.cpu().numpy())
@@ -236,7 +236,7 @@ if __name__ == "__main__":
                 action = behavior.actor(feat).sample()
                 last_action = action
 
-            action_np = action.cpu().numpy().clip(-1.0, 1.0)
+            action_np = action.cpu().numpy().astype(np.float64).clip(-1.0, 1.0)
             obs_np, reward_np, term_np, trunc_np, _ = env.step(action_np)
             done_np = term_np | trunc_np
 
@@ -267,7 +267,10 @@ if __name__ == "__main__":
         
         log_dict = {"charts/episode_return": mr, "charts/episode_length": ml, "charts/SPS": sps}
         for k, v in {**wm_metrics, **ac_metrics}.items():
-            if v is not None: log_dict[f"losses/{k}"] = float(v)
+            if v is not None:
+                if hasattr(v, 'detach'): 
+                    v = v.detach().cpu().numpy()
+                log_dict[f"losses/{k}"] = float(np.mean(v))
         wandb.log(log_dict, step=global_step)
 
         if update % args.video_interval == 0 and args.capture_video:
