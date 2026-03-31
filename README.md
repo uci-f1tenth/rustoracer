@@ -12,6 +12,14 @@ Make sure you have CUDA installed! :P
 ```bash
 uv run --python 3.10 scripts/learnrl_autodrive.py
 ```
+### learnrl-dreamer
+*discarded with flags for some unclear reason causing uv to fetch the wrong version of torch
+*cpu untested
+```bash
+uv pip install torch --index-url https://download.pytorch.org/whl/cu130
+uv pip install tensordict tqdm tyro "wandb[media]" ruamel.yaml tensorboard
+uv run scripts/learnrl_dreamer.py
+```
 ## Devcontainer
 Rebuild and reopen in container
 ## Starting up scripts
