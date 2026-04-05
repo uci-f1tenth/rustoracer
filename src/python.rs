@@ -1,13 +1,11 @@
+use crate::Sim;
 use numpy::{IntoPyArray, PyArray1, PyArray3, ToPyArray};
 use pyo3::prelude::*;
 
-use crate::Sim;
-
 #[pymodule]
 mod rustoracer {
-    use numpy::PyReadonlyArray1;
-
     use super::*;
+    use numpy::PyReadonlyArray1;
 
     #[pyclass]
     struct PySim {
@@ -63,17 +61,21 @@ mod rustoracer {
                 .unwrap()
                 .chunks(2)
                 .enumerate()
-                .flat_map(|(i, chunk)| {
-                    let steer = chunk[0];
-                    let speed = chunk[1];
-                    let current_steer = self.sim.cars[i].steering;
-                    let current_speed = self.sim.cars[i].velocity;
-                    let steer_command = if steer > current_steer { 1.0 } else { -1.0 };
-                    let speed_command = if speed > current_speed { 1.0 } else { -1.0 };
-                    [steer_command, speed_command]
+                .flat_map(|(i, c)| {
+                    let ds = if c[0] > self.sim.cars[i].steering {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    let dv = if c[1] > self.sim.cars[i].velocity {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    [ds, dv]
                 })
                 .collect();
-            let o = self.sim.step(transformed.as_ref());
+            let o = self.sim.step(&transformed);
             (
                 o.scans.to_pyarray(py),
                 o.rewards.to_pyarray(py),
@@ -94,7 +96,7 @@ mod rustoracer {
             Bound<'py, PyArray1<bool>>,
             Bound<'py, PyArray1<f64>>,
         ) {
-            let o = self.sim.step(&actions.as_slice().unwrap());
+            let o = self.sim.step(actions.as_slice().unwrap());
             (
                 o.scans.to_pyarray(py),
                 o.rewards.to_pyarray(py),
@@ -132,20 +134,21 @@ mod rustoracer {
         }
 
         #[getter]
+        fn obs_dim(&self) -> usize {
+            self.sim.obs_dim
+        }
+        #[getter]
         fn n_beams(&self) -> usize {
             self.sim.n_beams
         }
-
         #[getter]
         fn min_range(&self) -> f64 {
             self.sim.min_range
         }
-
         #[getter]
         fn max_range(&self) -> f64 {
             self.sim.max_range
         }
-
         #[getter]
         fn fov(&self) -> f64 {
             self.sim.fov
@@ -156,19 +159,17 @@ mod rustoracer {
             py: Python<'py>,
             xy: PyReadonlyArray1<f64>,
         ) -> Bound<'py, PyArray1<f64>> {
-            let raw = xy.as_slice().unwrap();
-            let h = self.sim.map.img.height();
-            let inv_res = 1.0 / self.sim.map.res;
-            let ox = self.sim.map.ox;
-            let oy = self.sim.map.oy;
-            let out: Vec<f64> = raw
+            let (h, inv, ox, oy) = (
+                self.sim.map.img.height(),
+                1.0 / self.sim.map.res,
+                self.sim.map.ox,
+                self.sim.map.oy,
+            );
+            let out: Vec<f64> = xy
+                .as_slice()
+                .unwrap()
                 .chunks(2)
-                .flat_map(|p| {
-                    [
-                        (p[0] - ox) * inv_res,
-                        (h - 1) as f64 - (p[1] - oy) * inv_res,
-                    ]
-                })
+                .flat_map(|p| [(p[0] - ox) * inv, (h - 1) as f64 - (p[1] - oy) * inv])
                 .collect();
             out.into_pyarray(py)
         }
@@ -178,11 +179,11 @@ mod rustoracer {
                 .sim
                 .cars
                 .iter()
-                .flat_map(|car| {
+                .flat_map(|c| {
                     self.sim
                         .map
-                        .car_pixels(car)
-                        .flat_map(|(px, py)| [px as f64, py as f64])
+                        .car_pixels(c)
+                        .flat_map(|(x, y)| [x as f64, y as f64])
                 })
                 .collect();
             out.into_pyarray(py)
@@ -196,7 +197,7 @@ mod rustoracer {
                 .skeleton
                 .points
                 .iter()
-                .flat_map(|p| p.iter().copied())
+                .flat_map(|p| *p)
                 .collect();
             flat.into_pyarray(py)
         }
