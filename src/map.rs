@@ -10,6 +10,7 @@ use kiddo::SquaredEuclidean;
 use kiddo::immutable::float::kdtree::ImmutableKdTree;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::Deserialize;
+
 pub struct SkeletonConfig {
     pub open_radius: u32,
     pub sg_window: usize,
@@ -52,17 +53,14 @@ impl Skeleton {
         let mut ordered = extract_main_loop(&mut thinned, res, ox, oy);
         assert!(ordered.len() >= 2);
 
-        let dy = ordered[1][1] - ordered[0][1];
-        let dx = ordered[1][0] - ordered[0][0];
-        let diff = (dy.atan2(dx) - otheta + 3.0 * PI) % (2.0 * PI) - PI;
-        if diff.abs() > PI / 2.0 {
+        let diff = (ordered[1][1] - ordered[0][1]).atan2(ordered[1][0] - ordered[0][0]);
+        if ((diff - otheta + 3.0 * PI) % (2.0 * PI) - PI).abs() > PI / 2.0 {
             ordered[1..].reverse();
         }
 
         let smoothed = savitzky_golay_smooth(&ordered, cfg.sg_window, cfg.sg_degree);
         let tree = ImmutableKdTree::new_from_slice(&smoothed);
         let lut = Self::build_lut(&tree, img.width(), img.height(), res, ox, oy);
-
         Self {
             points: smoothed,
             lut,
@@ -96,6 +94,7 @@ impl Skeleton {
         (px, py, (ny - py).atan2(nx - px))
     }
 
+    #[inline]
     pub fn get_idx(&self, px: u32, py: u32) -> usize {
         self.lut[(py * self.width + px) as usize]
     }
@@ -157,14 +156,15 @@ impl OccGrid {
 
     #[inline]
     pub fn position_to_pixels(&self, x: f64, y: f64) -> (u32, u32) {
-        let px = ((x - self.ox) * self.inv_res) as u32;
-        let py = self.img.height() - 1 - ((y - self.oy) * self.inv_res) as u32;
-        (px, py)
+        (
+            ((x - self.ox) * self.inv_res) as u32,
+            self.img.height() - 1 - ((y - self.oy) * self.inv_res) as u32,
+        )
     }
 
     #[inline]
     pub fn edt(&self, px: u32, py: u32) -> f64 {
-        if (0..self.img.width()).contains(&px) && (0..self.img.height()).contains(&py) {
+        if px < self.img.width() && py < self.img.height() {
             unsafe {
                 *self
                     .edt

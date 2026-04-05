@@ -9,15 +9,11 @@ pub fn render_rgb(map: &OccGrid, cars: &[Car]) -> (Vec<u8>, u32, u32) {
     }
     for car in cars {
         for (x, y) in map.car_pixels(car) {
-            set_px(&mut buf, w, h, x, y, [43, 127, 255]);
+            if x < w && y < h {
+                let i = (y as usize * w as usize + x as usize) * 3;
+                buf[i..i + 3].copy_from_slice(&[43, 127, 255]);
+            }
         }
     }
     (buf, h, w)
-}
-
-fn set_px(buf: &mut [u8], w: u32, h: u32, x: u32, y: u32, c: [u8; 3]) {
-    if (0..w).contains(&x) && (0..h).contains(&y) {
-        let i = (y as usize * w as usize + x as usize) * 3;
-        buf[i..i + 3].copy_from_slice(&c);
-    }
 }

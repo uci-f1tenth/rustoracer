@@ -70,8 +70,7 @@ class RustoracerEnv(gym.vector.VectorEnv):
 
     def render(self):
         if self.render_mode == "human":
-            img = self._sim.render()
-            rr.log("world/image", rr.Image(img))
+            rr.log("world/image", rr.Image(self._sim.render()))
             scans, _, _, _, state = self._sim.observe()
             sk_px = self._sim.world_to_pixels(self.skeleton).reshape(-1, 2)
             rr.log("world/centerline", rr.LineStrips2D([sk_px]))
@@ -83,12 +82,25 @@ class RustoracerEnv(gym.vector.VectorEnv):
                 state[1] + scans[: self._sim.n_beams] * np.sin(angles),
             ]
             org = np.broadcast_to([[state[0], state[1]]], ends.shape)
-            ends_px = self._sim.world_to_pixels(ends.ravel()).reshape(-1, 2)
-            org_px = self._sim.world_to_pixels(org.ravel()).reshape(-1, 2)
-            rr.log("world/lidar", rr.LineStrips2D(np.stack([org_px, ends_px], axis=1)))
-            car_px = self._sim.car_pixels().reshape(-1, 2)
             rr.log(
-                "world/car", rr.Points2D(car_px, colors=[[43, 127, 255]], radii=[1.0])
+                "world/lidar",
+                rr.LineStrips2D(
+                    np.stack(
+                        [
+                            self._sim.world_to_pixels(org.ravel()).reshape(-1, 2),
+                            self._sim.world_to_pixels(ends.ravel()).reshape(-1, 2),
+                        ],
+                        axis=1,
+                    )
+                ),
+            )
+            rr.log(
+                "world/car",
+                rr.Points2D(
+                    self._sim.car_pixels().reshape(-1, 2),
+                    colors=[[43, 127, 255]],
+                    radii=[1.0],
+                ),
             )
         elif self.render_mode == "rgb_array":
             return self._sim.render()

@@ -12,6 +12,24 @@ mod rustoracer {
         sim: Sim,
     }
 
+    type Ret<'py> = (
+        Bound<'py, PyArray1<f64>>,
+        Bound<'py, PyArray1<f64>>,
+        Bound<'py, PyArray1<bool>>,
+        Bound<'py, PyArray1<bool>>,
+        Bound<'py, PyArray1<f64>>,
+    );
+
+    fn wrap<'py>(py: Python<'py>, o: crate::sim::Obs<'_>) -> Ret<'py> {
+        (
+            o.scans.to_pyarray(py),
+            o.rewards.to_pyarray(py),
+            o.terminated.to_pyarray(py),
+            o.truncated.to_pyarray(py),
+            o.state.to_pyarray(py),
+        )
+    }
+
     #[pymethods]
     impl PySim {
         #[new]
@@ -24,38 +42,18 @@ mod rustoracer {
         fn seed(&mut self, seed: u64) {
             self.sim.seed(seed);
         }
-
-        fn reset<'py>(
-            &mut self,
-            py: Python<'py>,
-        ) -> (
-            Bound<'py, PyArray1<f64>>,
-            Bound<'py, PyArray1<f64>>,
-            Bound<'py, PyArray1<bool>>,
-            Bound<'py, PyArray1<bool>>,
-            Bound<'py, PyArray1<f64>>,
-        ) {
-            let o = self.sim.reset();
-            (
-                o.scans.to_pyarray(py),
-                o.rewards.to_pyarray(py),
-                o.terminated.to_pyarray(py),
-                o.truncated.to_pyarray(py),
-                o.state.to_pyarray(py),
-            )
+        fn reset<'py>(&mut self, py: Python<'py>) -> Ret<'py> {
+            wrap(py, self.sim.reset())
+        }
+        fn observe<'py>(&mut self, py: Python<'py>) -> Ret<'py> {
+            wrap(py, self.sim.observe())
         }
 
-        fn easy_step<'py>(
-            &mut self,
-            py: Python<'py>,
-            actions: PyReadonlyArray1<f64>,
-        ) -> (
-            Bound<'py, PyArray1<f64>>,
-            Bound<'py, PyArray1<f64>>,
-            Bound<'py, PyArray1<bool>>,
-            Bound<'py, PyArray1<bool>>,
-            Bound<'py, PyArray1<f64>>,
-        ) {
+        fn step<'py>(&mut self, py: Python<'py>, actions: PyReadonlyArray1<f64>) -> Ret<'py> {
+            wrap(py, self.sim.step(actions.as_slice().unwrap()))
+        }
+
+        fn easy_step<'py>(&mut self, py: Python<'py>, actions: PyReadonlyArray1<f64>) -> Ret<'py> {
             let transformed: Vec<f64> = actions
                 .as_slice()
                 .unwrap()
@@ -75,35 +73,7 @@ mod rustoracer {
                     [ds, dv]
                 })
                 .collect();
-            let o = self.sim.step(&transformed);
-            (
-                o.scans.to_pyarray(py),
-                o.rewards.to_pyarray(py),
-                o.terminated.to_pyarray(py),
-                o.truncated.to_pyarray(py),
-                o.state.to_pyarray(py),
-            )
-        }
-
-        fn step<'py>(
-            &mut self,
-            py: Python<'py>,
-            actions: PyReadonlyArray1<f64>,
-        ) -> (
-            Bound<'py, PyArray1<f64>>,
-            Bound<'py, PyArray1<f64>>,
-            Bound<'py, PyArray1<bool>>,
-            Bound<'py, PyArray1<bool>>,
-            Bound<'py, PyArray1<f64>>,
-        ) {
-            let o = self.sim.step(actions.as_slice().unwrap());
-            (
-                o.scans.to_pyarray(py),
-                o.rewards.to_pyarray(py),
-                o.terminated.to_pyarray(py),
-                o.truncated.to_pyarray(py),
-                o.state.to_pyarray(py),
-            )
+            wrap(py, self.sim.step(&transformed))
         }
 
         fn render<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray3<u8>> {
@@ -111,26 +81,6 @@ mod rustoracer {
             numpy::ndarray::Array3::from_shape_vec((h as usize, w as usize, 3), buf)
                 .unwrap()
                 .into_pyarray(py)
-        }
-
-        fn observe<'py>(
-            &mut self,
-            py: Python<'py>,
-        ) -> (
-            Bound<'py, PyArray1<f64>>,
-            Bound<'py, PyArray1<f64>>,
-            Bound<'py, PyArray1<bool>>,
-            Bound<'py, PyArray1<bool>>,
-            Bound<'py, PyArray1<f64>>,
-        ) {
-            let o = self.sim.observe();
-            (
-                o.scans.to_pyarray(py),
-                o.rewards.to_pyarray(py),
-                o.terminated.to_pyarray(py),
-                o.truncated.to_pyarray(py),
-                o.state.to_pyarray(py),
-            )
         }
 
         #[getter]
@@ -165,18 +115,16 @@ mod rustoracer {
                 self.sim.map.ox,
                 self.sim.map.oy,
             );
-            let out: Vec<f64> = xy
-                .as_slice()
+            xy.as_slice()
                 .unwrap()
                 .chunks(2)
                 .flat_map(|p| [(p[0] - ox) * inv, (h - 1) as f64 - (p[1] - oy) * inv])
-                .collect();
-            out.into_pyarray(py)
+                .collect::<Vec<f64>>()
+                .into_pyarray(py)
         }
 
         fn car_pixels<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-            let out: Vec<f64> = self
-                .sim
+            self.sim
                 .cars
                 .iter()
                 .flat_map(|c| {
@@ -185,21 +133,20 @@ mod rustoracer {
                         .car_pixels(c)
                         .flat_map(|(x, y)| [x as f64, y as f64])
                 })
-                .collect();
-            out.into_pyarray(py)
+                .collect::<Vec<f64>>()
+                .into_pyarray(py)
         }
 
         #[getter]
         fn skeleton<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-            let flat: Vec<f64> = self
-                .sim
+            self.sim
                 .map
                 .skeleton
                 .points
                 .iter()
                 .flat_map(|p| *p)
-                .collect();
-            flat.into_pyarray(py)
+                .collect::<Vec<f64>>()
+                .into_pyarray(py)
         }
     }
 }
