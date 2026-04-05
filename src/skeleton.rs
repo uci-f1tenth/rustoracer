@@ -2,91 +2,151 @@ use image::{GrayImage, Luma};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 const BG: u8 = 255;
-const DIRS: [(i32, i32); 8] = [
-    (1, 1),
-    (1, 0),
-    (1, -1),
-    (0, 1),
-    (0, -1),
-    (-1, 1),
-    (-1, 0),
-    (-1, -1),
-];
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(u8)]
+pub enum Edge {
+    Empty = 0,
+    Filled = 1,
+    DoesNotExist,
+}
+
+pub struct NeighborInfo {
+    pub filled: u8,
+    pub neighbors: u8,
+    pub edge_status: [Edge; 8],
+}
+
+pub fn get_neighbor_info(img: &GrayImage, width: u32, height: u32, x: u32, y: u32) -> NeighborInfo {
+    let mut filled = 0u8;
+    let mut neighbors = 0u8;
+
+    macro_rules! check {
+        ($cond:expr, $px:expr, $py:expr) => {
+            if $cond {
+                neighbors += 1;
+                if img.get_pixel($px, $py)[0] != BG {
+                    filled += 1;
+                    Edge::Filled
+                } else {
+                    Edge::Empty
+                }
+            } else {
+                Edge::DoesNotExist
+            }
+        };
+    }
+
+    let p9 = check!(y > 0 && x > 0, x - 1, y - 1);
+    let p2 = check!(y > 0, x, y - 1);
+    let p3 = check!(y > 0 && x + 1 < width, x + 1, y - 1);
+    let p8 = check!(x > 0, x - 1, y);
+    let p4 = check!(x + 1 < width, x + 1, y);
+    let p7 = check!(x > 0 && y + 1 < height, x - 1, y + 1);
+    let p6 = check!(y + 1 < height, x, y + 1);
+    let p5 = check!(x + 1 < width && y + 1 < height, x + 1, y + 1);
+
+    NeighborInfo {
+        filled,
+        neighbors,
+        edge_status: [p2, p3, p4, p5, p6, p7, p8, p9],
+    }
+}
 
 pub fn thin_image_edges(img_in: &GrayImage) -> GrayImage {
     let mut img = img_in.clone();
-    let (w, h) = (img.width(), img.height());
-    let mut to_remove = Vec::with_capacity(1024);
+    let mut to_remove = Vec::new();
     let mut phase_one = true;
 
     loop {
-        for y in 1..h - 1 {
-            for x in 1..w - 1 {
-                if img.get_pixel(x, y).0[0] == BG {
-                    continue;
-                }
+        for (x, y, p) in img.enumerate_pixels() {
+            if p.0[0] == BG {
+                continue;
+            }
+            let info = get_neighbor_info(&img, img.width(), img.height(), x, y);
+            let [p2, p3, p4, p5, p6, p7, p8, p9] = info.edge_status;
+            if !(2..=7).contains(&info.filled) || info.neighbors != 8 {
+                continue;
+            }
 
-                let p = |dx: i32, dy: i32| {
-                    img.get_pixel((x as i32 + dx) as u32, (y as i32 + dy) as u32)
-                        .0[0]
-                        != BG
-                };
-                let n = [
-                    p(0, -1),
-                    p(1, -1),
-                    p(1, 0),
-                    p(1, 1),
-                    p(0, 1),
-                    p(-1, 1),
-                    p(-1, 0),
-                    p(-1, -1),
-                ];
-                let filled = n.iter().filter(|&&v| v).count();
-                if !(2..=7).contains(&filled) {
-                    continue;
-                }
+            let transitions = [p2, p3, p4, p5, p6, p7, p8, p9, p2]
+                .windows(2)
+                .filter(|w| w[0] == Edge::Empty && w[1] == Edge::Filled)
+                .count();
 
-                let trans = (0..8).filter(|&i| !n[i] && n[(i + 1) & 7]).count();
-                if trans != 1 && trans != 2 {
-                    continue;
-                }
+            if !(transitions == 1 || transitions == 2) {
+                continue;
+            }
 
-                let [p2, p3, p4, p5, p6, p7, p8, p9] = n;
-                let remove = if phase_one {
-                    if trans == 1 {
-                        !p4 || !p6 || (!p2 && !p8)
-                    } else {
-                        (p2 && p4 && !p6 && !p7 && !p8) || (p4 && p6 && !p2 && !p8 && !p9)
-                    }
+            let remove = if phase_one {
+                if transitions == 1 {
+                    p4 == Edge::Empty
+                        || p6 == Edge::Empty
+                        || (p2 == Edge::Empty && p8 == Edge::Empty)
                 } else {
-                    if trans == 1 {
-                        !p2 || !p8 || (!p4 && !p6)
-                    } else {
-                        (p2 && p8 && !p4 && !p5 && !p6) || (p6 && p8 && !p2 && !p3 && !p4)
-                    }
-                };
-                if remove {
-                    to_remove.push((x, y));
+                    (p2 == Edge::Filled
+                        && p4 == Edge::Filled
+                        && p6 == Edge::Empty
+                        && p7 == Edge::Empty
+                        && p8 == Edge::Empty)
+                        || (p4 == Edge::Filled
+                            && p6 == Edge::Filled
+                            && p2 == Edge::Empty
+                            && p8 == Edge::Empty
+                            && p9 == Edge::Empty)
                 }
+            } else {
+                if transitions == 1 {
+                    p2 == Edge::Empty
+                        || p8 == Edge::Empty
+                        || (p4 == Edge::Empty && p6 == Edge::Empty)
+                } else {
+                    (p2 == Edge::Filled
+                        && p8 == Edge::Filled
+                        && p4 == Edge::Empty
+                        && p5 == Edge::Empty
+                        && p6 == Edge::Empty)
+                        || (p6 == Edge::Filled
+                            && p8 == Edge::Filled
+                            && p2 == Edge::Empty
+                            && p3 == Edge::Empty
+                            && p4 == Edge::Empty)
+                }
+            };
+
+            if remove {
+                to_remove.push((x, y));
             }
         }
 
         phase_one = !phase_one;
-        if to_remove.is_empty() {
-            return img;
-        }
         for &(x, y) in &to_remove {
             img.put_pixel(x, y, Luma([BG]));
+        }
+        if to_remove.is_empty() {
+            return img;
         }
         to_remove.clear();
     }
 }
 
-fn adj(fg: &HashSet<(u32, u32)>, x: u32, y: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
-    DIRS.iter().filter_map(move |&(dx, dy)| {
+fn adj(fg: &HashSet<(u32, u32)>, x: u32, y: u32) -> Vec<(u32, u32)> {
+    [
+        (1, 1),
+        (1, 0),
+        (1, -1),
+        (0, 1),
+        (0, -1),
+        (-1, 1),
+        (-1, 0),
+        (-1, -1),
+    ]
+    .iter()
+    .filter_map(|&(dx, dy)| {
         let n = ((x as i32 + dx) as u32, (y as i32 + dy) as u32);
         fg.contains(&n).then_some(n)
     })
+    .collect()
 }
 
 pub fn extract_main_loop(img: &mut GrayImage, res: f64, ox: f64, oy: f64) -> Vec<[f64; 2]> {
@@ -97,15 +157,16 @@ pub fn extract_main_loop(img: &mut GrayImage, res: f64, ox: f64, oy: f64) -> Vec
         .collect();
 
     let origin_px = (-ox / res, (img.height() - 1) as f64 + oy / res);
-    let start = *fg
+    let start = fg
         .iter()
-        .min_by_key(|&&(x, y)| {
+        .copied()
+        .min_by_key(|&(x, y)| {
             let (dx, dy) = (x as f64 - origin_px.0, y as f64 - origin_px.1);
             (dx * dx + dy * dy) as i64
         })
         .unwrap();
 
-    let nbrs: Vec<_> = adj(&fg, start.0, start.1).collect();
+    let nbrs = adj(&fg, start.0, start.1);
     if nbrs.len() < 2 {
         return Vec::new();
     }
@@ -155,35 +216,54 @@ pub fn extract_main_loop(img: &mut GrayImage, res: f64, ox: f64, oy: f64) -> Vec
         .collect()
 }
 
-fn morph_op(img: &GrayImage, radius: u32, is_dilate: bool) -> GrayImage {
+pub fn erode(img: &GrayImage, radius: u32) -> GrayImage {
     let (w, h) = (img.width(), img.height());
     let r = radius as i32;
     GrayImage::from_fn(w, h, |x, y| {
-        let hit = (-r..=r).any(|dy| {
-            (-r..=r).any(|dx| {
+        let fg = (-r..=r).all(|dy| {
+            (-r..=r).all(|dx| {
                 if dx * dx + dy * dy > r * r {
-                    return is_dilate;
+                    return true;
                 }
                 let (nx, ny) = (x as i32 + dx, y as i32 + dy);
                 if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
-                    return is_dilate;
+                    return false;
                 }
-                let fg = img.get_pixel(nx as u32, ny as u32).0[0] != BG;
-                if is_dilate { fg } else { !fg }
+                img.get_pixel(nx as u32, ny as u32).0[0] != BG
             })
         });
-        let fg = if is_dilate { hit } else { !hit };
+        Luma([if fg { 0 } else { BG }])
+    })
+}
+
+pub fn dilate(img: &GrayImage, radius: u32) -> GrayImage {
+    let (w, h) = (img.width(), img.height());
+    let r = radius as i32;
+    GrayImage::from_fn(w, h, |x, y| {
+        let fg = (-r..=r).any(|dy| {
+            (-r..=r).any(|dx| {
+                if dx * dx + dy * dy > r * r {
+                    return false;
+                }
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                    return false;
+                }
+                img.get_pixel(nx as u32, ny as u32).0[0] != BG
+            })
+        });
         Luma([if fg { 0 } else { BG }])
     })
 }
 
 pub fn morphological_open(img: &GrayImage, radius: u32) -> GrayImage {
-    morph_op(&morph_op(img, radius, false), radius, true)
+    dilate(&erode(img, radius), radius)
 }
 
 fn sg_weights(window: usize, degree: usize) -> Vec<f64> {
     let half = window / 2;
     let d = degree + 1;
+
     let a: Vec<Vec<f64>> = (0..window)
         .map(|i| {
             let t = i as f64 - half as f64;
@@ -191,38 +271,49 @@ fn sg_weights(window: usize, degree: usize) -> Vec<f64> {
         })
         .collect();
 
-    let mut ata = vec![vec![0.0; d + 1]; d];
+    let mut ata = vec![vec![0.0f64; d]; d];
     for i in 0..d {
         for j in 0..d {
-            ata[i][j] = (0..window).map(|k| a[k][i] * a[k][j]).sum();
-        }
-    }
-    ata[0][d] = 1.0;
-
-    for col in 0..d {
-        let max_row = (col..d)
-            .max_by(|&i, &j| ata[i][col].abs().total_cmp(&ata[j][col].abs()))
-            .unwrap();
-        ata.swap(col, max_row);
-        let pivot = ata[col][col];
-        if pivot.abs() < 1e-12 {
-            continue;
-        }
-        for row in (col + 1)..d {
-            let f = ata[row][col] / pivot;
-            for k in col..=d {
-                ata[row][k] -= f * ata[col][k];
+            for k in 0..window {
+                ata[i][j] += a[k][i] * a[k][j];
             }
         }
     }
 
-    let mut x = vec![0.0; d];
-    for i in (0..d).rev() {
-        x[i] = ata[i][d];
-        for j in (i + 1)..d {
-            x[i] -= ata[i][j] * x[j];
+    let mut aug: Vec<Vec<f64>> = ata
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let mut r = row.clone();
+            r.push(if i == 0 { 1.0 } else { 0.0 });
+            r
+        })
+        .collect();
+
+    for col in 0..d {
+        let max_row = (col..d)
+            .max_by(|&i, &j| aug[i][col].abs().partial_cmp(&aug[j][col].abs()).unwrap())
+            .unwrap();
+        aug.swap(col, max_row);
+        let pivot = aug[col][col];
+        if pivot.abs() < 1e-12 {
+            continue;
         }
-        x[i] /= ata[i][i];
+        for row in (col + 1)..d {
+            let f = aug[row][col] / pivot;
+            for k in col..=d {
+                aug[row][k] -= f * aug[col][k];
+            }
+        }
+    }
+
+    let mut x = vec![0.0f64; d];
+    for i in (0..d).rev() {
+        x[i] = aug[i][d];
+        for j in (i + 1)..d {
+            x[i] -= aug[i][j] * x[j];
+        }
+        x[i] /= aug[i][i];
     }
 
     (0..window)
