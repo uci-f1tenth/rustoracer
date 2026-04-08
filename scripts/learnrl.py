@@ -1,22 +1,22 @@
 from __future__ import annotations
 
-import math
 import os
 import random
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Tuple
 
-import gymnasium as gym
+import av
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import tqdm
 import tyro
-import wandb
 from torch.distributions.normal import Normal
 
+import wandb
 from rustoracerpy import RustoracerEnv
 
 
@@ -88,6 +88,8 @@ class Args:
     """record an evaluation video every N iterations (0 to disable)"""
     video_max_steps: int = 3_600
     """max steps per evaluation video episode"""
+    video_crf: int = 23
+    """H.264 CRF quality (0=lossless, 51=worst; 18-28 is typical)"""
 
     save_interval: int = 50
     """save checkpoint every N iterations"""
@@ -219,7 +221,8 @@ class Agent(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────
-# Video recording helper
+# Video recording helper — streams frames via PyAV directly to
+# a temp MP4 on disk.  No large in-memory frame buffer.
 # ─────────────────────────────────────────────────────────────
 @torch.no_grad()
 def record_eval_video(
@@ -227,32 +230,74 @@ def record_eval_video(
     agent: Agent,
     obs_rms_cpu: CPURunningMeanStd,
     device: torch.device,
+    save_dir: str,
     max_steps: int = 600,
     max_ep_steps: int = 10_000,
+    fps: int = 60,
+    crf: int = 23,
 ) -> Tuple["wandb.Video | None", float]:
     eval_env = RustoracerEnv(
         yaml=yaml, num_envs=1, max_steps=max_ep_steps, render_mode="rgb_array"
     )
     raw_obs, _ = eval_env.reset(seed=42)
-    frames: list[np.ndarray] = []
+
+    # Fixed path that gets overwritten each time.  wandb.Video holds a
+    # reference to the path and copies it asynchronously during log(), so the
+    # file must remain on disk until after wandb.log() returns — a temp file
+    # deleted immediately after Video() construction races with that copy.
+    out_path = os.path.join(save_dir, "eval_video.mp4")
+
+    container: av.container.OutputContainer | None = None
+    stream: av.video.stream.VideoStream | None = None
     total_reward = 0.0
-    for _ in range(max_steps):
-        frame = eval_env.render()
-        if frame is not None:
-            frames.append(frame)
-        obs_norm = obs_rms_cpu.normalize(raw_obs)
-        obs_t = torch.tensor(obs_norm, device=device, dtype=torch.float32)
-        action_mean = agent.actor_mean(obs_t)
-        action_np = action_mean.cpu().numpy().astype(np.float64).clip(-1.0, 1.0)
-        raw_obs, reward, terminated, truncated, _ = eval_env.step(action_np)
-        total_reward += float(reward[0])
-        if terminated[0] or truncated[0]:
-            break
-    eval_env.close()
-    if not frames:
+    frames_written = 0
+
+    try:
+        for _ in range(max_steps):
+            frame_np = eval_env.render()  # H×W×3 uint8, or None
+
+            if frame_np is not None:
+                # Lazy-open: we need frame dimensions before creating the stream.
+                if container is None:
+                    h, w = frame_np.shape[:2]
+                    # Ensure dimensions are even (H.264 requirement).
+                    h += h % 2
+                    w += w % 2
+                    container = av.open(out_path, mode="w")
+                    stream = container.add_stream("h264", rate=fps)
+                    stream.width = w
+                    stream.height = h
+                    stream.pix_fmt = "yuv420p"
+                    # CRF via private options (libx264).
+                    stream.options = {"crf": str(crf), "preset": "ultrafast"}
+
+                av_frame = av.VideoFrame.from_ndarray(frame_np, format="rgb24")
+                for packet in stream.encode(av_frame):
+                    container.mux(packet)
+                frames_written += 1
+
+            obs_norm = obs_rms_cpu.normalize(raw_obs)
+            obs_t = torch.tensor(obs_norm, device=device, dtype=torch.float32)
+            action_mean = agent.actor_mean(obs_t)
+            action_np = action_mean.cpu().numpy().astype(np.float64).clip(-1.0, 1.0)
+            raw_obs, reward, terminated, truncated, _ = eval_env.step(action_np)
+            total_reward += float(reward[0])
+            if terminated[0] or truncated[0]:
+                break
+
+    finally:
+        eval_env.close()
+        if container is not None:
+            # Flush encoder and finalize the container (writes moov atom).
+            for packet in stream.encode():
+                container.mux(packet)
+            container.close()
+
+    if frames_written == 0:
         return None, total_reward
-    video_np = np.stack(frames).transpose(0, 3, 1, 2)
-    return wandb.Video(video_np, fps=60, format="mp4"), total_reward
+
+    # wandb copies the file during log() — the file must still exist then.
+    return wandb.Video(out_path, format="mp4"), total_reward
 
 
 # ─────────────────────────────────────────────────────────────
@@ -393,8 +438,10 @@ if __name__ == "__main__":
     # ── episode trackers (CPU — avoids GPU syncs) ────────────────
     ep_ret_cpu = np.zeros(args.num_envs, dtype=np.float64)
     ep_len_cpu = np.zeros(args.num_envs, dtype=np.int64)
-    recent_returns: list[float] = []
-    recent_lengths: list[int] = []
+    # FIX: bounded deques instead of unbounded lists — only last 200 entries
+    # are ever read, so anything older is pure memory waste.
+    recent_returns: deque[float] = deque(maxlen=200)
+    recent_lengths: deque[int] = deque(maxlen=200)
 
     # ── Reusable CPU buffer for clipped actions ──────────────────
     act_np_buf = np.empty((args.num_envs, act_dim), dtype=np.float64)
@@ -646,8 +693,8 @@ if __name__ == "__main__":
         # ── logging ──────────────────────────────────────────────
         elapsed = time.time() - t0
         sps = global_step / elapsed
-        mr = float(np.mean(recent_returns[-200:])) if recent_returns else 0.0
-        ml = float(np.mean(recent_lengths[-200:])) if recent_lengths else 0.0
+        mr = float(np.mean(recent_returns)) if recent_returns else 0.0
+        ml = float(np.mean(recent_lengths)) if recent_lengths else 0.0
 
         log_dict = {
             "charts/episode_return": mr,
@@ -672,8 +719,10 @@ if __name__ == "__main__":
                 agent=agent,
                 obs_rms_cpu=obs_rms_cpu,
                 device=device,
+                save_dir=args.save_dir,
                 max_steps=args.video_max_steps,
                 max_ep_steps=args.max_ep_steps,
+                crf=args.video_crf,
             )
             eval_log: dict = {"charts/eval_return": eval_reward}
             if vid is not None:

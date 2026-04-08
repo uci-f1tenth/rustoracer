@@ -1,7 +1,7 @@
 # Install instructions
 ### learnrl.py 
 ```bash
-uv run --with torch --with tensordict --with tqdm --with tyro --with wandb[media] scripts/learnrl.py
+uv run --with torch --with tensordict --with tqdm --with tyro --with wandb[media] --with av scripts/learnrl.py
 ```
 ### autodrive learnrl
 ```bash
