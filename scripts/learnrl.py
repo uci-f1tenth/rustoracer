@@ -197,6 +197,7 @@ class Agent(nn.Module):
             layer_init(nn.Linear(hidden, act_dim), std=0.01),
         )
         self.actor_logstd = nn.Parameter(torch.full((1, act_dim), -0.5))
+        self._noise_buf: torch.Tensor | None = None
 
     def get_value(self, x: torch.Tensor) -> torch.Tensor:
         return self.critic(x)
@@ -211,7 +212,10 @@ class Agent(nn.Module):
         std = log_std.exp()
         dist = Normal(mean, std)
         if action is None:
-            action = mean + std * torch.randn_like(mean)
+            if self._noise_buf is None or self._noise_buf.shape != mean.shape:
+                self._noise_buf = torch.empty_like(mean)
+            self._noise_buf.normal_()
+            action = mean + std * self._noise_buf
         return (
             action,
             dist.log_prob(action).sum(-1),
@@ -241,10 +245,6 @@ def record_eval_video(
     )
     raw_obs, _ = eval_env.reset(seed=42)
 
-    # Fixed path that gets overwritten each time.  wandb.Video holds a
-    # reference to the path and copies it asynchronously during log(), so the
-    # file must remain on disk until after wandb.log() returns — a temp file
-    # deleted immediately after Video() construction races with that copy.
     out_path = os.path.join(save_dir, "eval_video.mp4")
 
     container: av.container.OutputContainer | None = None
@@ -438,13 +438,13 @@ if __name__ == "__main__":
     # ── episode trackers (CPU — avoids GPU syncs) ────────────────
     ep_ret_cpu = np.zeros(args.num_envs, dtype=np.float64)
     ep_len_cpu = np.zeros(args.num_envs, dtype=np.int64)
-    # FIX: bounded deques instead of unbounded lists — only last 200 entries
-    # are ever read, so anything older is pure memory waste.
     recent_returns: deque[float] = deque(maxlen=200)
     recent_lengths: deque[int] = deque(maxlen=200)
 
     # ── Reusable CPU buffer for clipped actions ──────────────────
     act_np_buf = np.empty((args.num_envs, act_dim), dtype=np.float64)
+
+    b_inds = torch.empty(batch_size, dtype=torch.long, device=device)
 
     # ── first reset ──────────────────────────────────────────────
     next_obs_raw_np, _ = env.reset(seed=args.seed)
@@ -514,8 +514,10 @@ if __name__ == "__main__":
         ratio = logratio.exp()
 
         with torch.no_grad():
-            approx_kl = ((ratio - 1) - logratio).mean()
-            clipfrac = ((ratio - 1.0).abs() > _clip_coef).float().mean()
+            ratio_d = ratio.detach()
+            logratio_d = logratio.detach()
+            approx_kl = ((ratio_d - 1) - logratio_d).mean()
+            clipfrac = ((ratio_d - 1.0).abs() > _clip_coef).float().mean()
 
         mb_adv = b_adv[mb_inds]
         if _norm_adv:
@@ -546,13 +548,12 @@ if __name__ == "__main__":
         nn.utils.clip_grad_norm_(agent.parameters(), _max_grad_norm)
         optimizer.step()
 
-        return (
-            pg_loss.detach(),
-            v_loss.detach(),
-            ent_loss.detach(),
-            approx_kl.detach(),
-            clipfrac.detach(),
-        )
+        pg_loss_d = pg_loss.detach()
+        v_loss_d = v_loss.detach()
+        ent_loss_d = ent_loss.detach()
+        del loss, pg1, pg2, pg_loss, v_loss, ent_loss, ratio, logratio
+
+        return pg_loss_d, v_loss_d, ent_loss_d, approx_kl, clipfrac
 
     if args.compile:
         compute_gae = torch.compile(compute_gae, fullgraph=True)
@@ -660,7 +661,7 @@ if __name__ == "__main__":
         for _epoch in range(args.update_epochs):
             if kl_early_stopped:
                 break
-            b_inds = torch.randperm(batch_size, device=device)
+            torch.randperm(batch_size, out=b_inds, device=device)
             for start in range(0, batch_size, args.minibatch_size):
                 mb_inds = b_inds[start : start + args.minibatch_size]
 

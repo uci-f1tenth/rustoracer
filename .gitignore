@@ -26,3 +26,5 @@ videos
 runs
 
 checkpoints
+*.bin
+*.html
