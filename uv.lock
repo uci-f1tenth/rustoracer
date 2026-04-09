@@ -303,8 +303,8 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "gymnasium", specifier = ">=1.1.1" },
-    { name = "numpy", specifier = ">=2.4.2" },
+    { name = "gymnasium", specifier = ">=0.29.0" },
+    { name = "numpy", specifier = ">=1.26.4" },
     { name = "rerun-sdk", specifier = ">=0.30.0" },
 ]
 
