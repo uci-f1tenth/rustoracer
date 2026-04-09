@@ -15,7 +15,7 @@ dynamic = ["version"]
 dependencies = [
     "gymnasium>=0.29.0",
     "numpy>=1.26.4",
-    "rerun-sdk>=0.30.0",
+    "rerun-sdk>=0.20.0",
 ]
 
 [tool.maturin]
