@@ -8,7 +8,36 @@ on:
 
 jobs:
   build-linux:
-    name: Build (Linux)
+    name: Build (Linux, Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Install Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist --interpreter python${{ matrix.python-version }}
+          target: x86_64
+      - name: Smoke test (wheel)
+        run: uv run --python ${{ matrix.python-version }} --isolated --no-project --with dist/*.whl --with gymnasium tests/smoke_test.py
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-ubuntu-latest-py${{ matrix.python-version }}
+          path: dist/*.whl
+
+  build-linux-sdist:
+    name: Build source distribution (Linux)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -19,22 +48,10 @@ jobs:
           python-version: "3.14"
       - name: Install uv
         uses: astral-sh/setup-uv@v6
-      - name: Build wheel
-        uses: PyO3/maturin-action@v1
-        with:
-          args: --release --out dist --interpreter python3.14
-          target: x86_64
-      - name: Smoke test (wheel)
-        run: uv run --python 3.14 --isolated --no-project --with dist/*.whl --with gymnasium tests/smoke_test.py
       - name: Build source distribution
         run: uv build --sdist
       - name: Smoke test (source distribution)
         run: uv run --python 3.14 --isolated --no-project --with dist/*.tar.gz --with gymnasium tests/smoke_test.py
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-ubuntu-latest
-          path: dist/*.whl
       - name: Upload source distribution
         uses: actions/upload-artifact@v4
         with:
@@ -42,33 +59,40 @@ jobs:
           path: dist/*.tar.gz
 
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     defaults:
       run:
         shell: bash
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+      - name: Install Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
       - name: Install uv
         uses: astral-sh/setup-uv@v6
-      - name: Build
-        run: uv build
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist --interpreter python${{ matrix.python-version }}
       - name: Smoke test (wheel)
-        run: uv run --isolated --no-project --with dist/*.whl --with gymnasium tests/smoke_test.py
+        run: uv run --python ${{ matrix.python-version }} --isolated --no-project --with dist/*.whl --with gymnasium tests/smoke_test.py
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
+          name: wheels-${{ matrix.os }}-py${{ matrix.python-version }}
           path: dist/*.whl
 
   publish:
     name: Publish to PyPI
-    needs: [build-linux, build]
+    needs: [build-linux, build-linux-sdist, build]
     runs-on: ubuntu-latest
     environment:
       name: pypi
