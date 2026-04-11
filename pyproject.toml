@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "rustoracerpy"
 description = "A Python/gym wrapper for the Rustoracer library."
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
