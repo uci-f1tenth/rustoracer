@@ -1,6 +1,7 @@
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.10, <3.12"
 # dependencies = [
+#     "rustoracerpy",
 #     "tensordict>=0.11.0",
 #     "torch>=2.10.0",
 #     "tqdm>=4.67.3",
@@ -32,26 +33,53 @@ AutoDRIVE accepts:
 
 We integrate d_steer into a tracked steering angle (matching the sim)
 and send it as a normalized steering command.
+
+Observation vector (obs_dim = N_LIDAR_OBS + 3 + 2 + N_LOOK*2):
+  [0:N_LIDAR_OBS]               downsampled lidar ranges
+  [N_LIDAR_OBS]                 speed (m/s)
+  [N_LIDAR_OBS+1]               steering angle (rad)
+  [N_LIDAR_OBS+2]               yaw rate (rad/s)
+  [N_LIDAR_OBS+3]               heading difference to centerline (rad)
+  [N_LIDAR_OBS+4]               lateral offset from centerline (m)
+  [N_LIDAR_OBS+5 : obs_dim]     N_LOOK lookahead waypoints in car frame (dx, dy each)
 """
 
+import argparse
+
+import autodrive
+import eventlet
 import numpy as np
+import socketio
 import torch
 import torch.nn as nn
-import socketio
-import eventlet
 from flask import Flask
-import autodrive
+from rustoracerpy.rustoracer import PySim
+
+# ── CLI ──
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--map", default="maps/my_map.yaml", help="path to map YAML")
+_parser.add_argument(
+    "--checkpoint", default="checkpoints/agent_final.pt", help="path to checkpoint"
+)
+_cli = _parser.parse_args()
 
 # ── Vehicle constants (from AutoDRIVE docs / sim) ──
 STEER_MAX = 0.5236  # rad (±30°)
 STEER_VEL_MAX = 3.2  # rad/s  (steering rate limit)
 N_LIDAR_RAW = 1080  # AutoDRIVE LIDAR measurements per scan
 N_LIDAR_OBS = 108  # downsampled beams to match sim training
+N_LOOK = 10  # lookahead waypoints (must match training; see sim.rs N_LOOK)
+
+# ── Load checkpoint ──
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ckpt = torch.load(_cli.checkpoint, map_location=DEVICE, weights_only=False)
+obs_mean, obs_var = ckpt["obs_rms_mean"].numpy(), ckpt["obs_rms_var"].numpy()
+OBS_DIM = obs_mean.shape[0]  # inferred from checkpoint (133 for centerline model)
 
 
 # ── Agent (must match training architecture) ──
 class Agent(nn.Module):
-    def __init__(self, obs=111, act=2, h=256):
+    def __init__(self, obs=OBS_DIM, act=2, h=256):
         super().__init__()
         self.actor_mean = nn.Sequential(
             nn.Linear(obs, h), nn.Tanh(), nn.Linear(h, h), nn.Tanh(), nn.Linear(h, act)
@@ -61,13 +89,30 @@ class Agent(nn.Module):
         return self.actor_mean(x)
 
 
-# ── Load checkpoint ──
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ckpt = torch.load("checkpoints/agent_final.pt", map_location=DEVICE, weights_only=False)
 agent = Agent()
 agent.load_state_dict(ckpt["model"], strict=False)
 agent.to(DEVICE).eval()
-obs_mean, obs_var = ckpt["obs_rms_mean"].numpy(), ckpt["obs_rms_var"].numpy()
+
+# ── Centerline setup (mirrors sim.rs skeleton / look_step logic) ──
+_sim = PySim(
+    _cli.map, 1, 1
+)  # num_envs=1, max_steps=1 — only used to extract the skeleton
+_skeleton_pts: np.ndarray = _sim.skeleton.reshape(-1, 2)  # (N, 2) world coords
+del _sim
+
+N_WPS = len(_skeleton_pts)
+_diffs = np.hypot(
+    np.roll(_skeleton_pts[:, 0], -1) - _skeleton_pts[:, 0],
+    np.roll(_skeleton_pts[:, 1], -1) - _skeleton_pts[:, 1],
+)
+LOOK_STEP = max(1, round(1.0 / float(_diffs.mean())))
+
+
+def _yaw_from_quat(q: np.ndarray) -> float:
+    """Extract yaw angle from a [qx, qy, qz, qw] quaternion."""
+    qx, qy, qz, qw = q
+    return float(np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)))
+
 
 # ── Helpers ──
 LIDAR_IDX = np.round(np.linspace(0, N_LIDAR_RAW - 1, N_LIDAR_OBS)).astype(int)
@@ -76,18 +121,51 @@ NOMINAL_DT = 1.0 / 60.0  # fixed dt for steering integration [s]
 
 
 def get_obs(f):
-    """Build the 111-d observation vector [108 lidar, velocity, steering, yaw_rate].
+    """Build the OBS_DIM-d observation vector.
 
-    Uses AutoDRIVE-reported speed, steering feedback, and angular velocity
-    instead of noisy finite-difference estimates.
+    Includes downsampled lidar, vehicle states (speed, steering, yaw rate),
+    and centerline features (heading diff, lateral offset, N_LOOK lookahead
+    waypoints in the car's local frame) to match the sim training environment.
     """
-    # Use the simulator-reported speed (clean) instead of finite-diff from position
+    # ── LiDAR ──
+    lidar = f.lidar_range_array[LIDAR_IDX]
+
+    # ── Vehicle states ──
     vel = f.speed
-    # Use actual steering feedback (in [-1, 1]) converted to radians
     steer_rad = f.steering * STEER_MAX
-    # Yaw rate from IMU angular velocity (Z-axis)
     yaw_rate = f.angular_velocity[2]
-    obs = np.concatenate([f.lidar_range_array[LIDAR_IDX], [vel, steer_rad, yaw_rate]])
+
+    # ── Car pose ──
+    x, y = f.position[0], f.position[1]
+    theta = _yaw_from_quat(f.orientation_quaternion)
+    ch, sh = np.cos(theta), np.sin(theta)
+
+    # ── Nearest centerline waypoint ──
+    wi = int(np.argmin(np.hypot(_skeleton_pts[:, 0] - x, _skeleton_pts[:, 1] - y)))
+
+    # Centerline heading at wi
+    cx, cy = _skeleton_pts[wi]
+    nx, ny = _skeleton_pts[(wi + 1) % N_WPS]
+    cth = np.arctan2(ny - cy, nx - cx)
+
+    # Heading difference (wrapped to [-π, π])
+    heading_diff = ((cth - theta) + np.pi) % (2.0 * np.pi) - np.pi
+
+    # Signed lateral offset: project the vector from the centerline point to the car
+    # onto the centerline's left-normal direction (perpendicular, rotated 90° CCW).
+    lat_off = -(x - cx) * np.sin(cth) + (y - cy) * np.cos(cth)
+
+    # ── Lookahead waypoints in car frame ──
+    lookahead = np.empty(N_LOOK * 2)
+    for k in range(N_LOOK):
+        wx, wy = _skeleton_pts[(wi + (k + 1) * LOOK_STEP) % N_WPS]
+        dx, dy = wx - x, wy - y
+        lookahead[k * 2] = dx * ch + dy * sh
+        lookahead[k * 2 + 1] = -dx * sh + dy * ch
+
+    obs = np.concatenate(
+        [lidar, [vel, steer_rad, yaw_rate, heading_diff, lat_off], lookahead]
+    )
     return np.clip((obs - obs_mean) / np.sqrt(obs_var + 1e-8), -10, 10)
 
 

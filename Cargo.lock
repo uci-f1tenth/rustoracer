@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "rustoracer"
-version = "0.5.4"
+version = "0.5.8"
 dependencies = [
  "futures",
  "image",
