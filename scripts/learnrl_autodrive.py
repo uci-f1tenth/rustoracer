@@ -2,6 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "rustoracerpy",
+#     "rerun-sdk>=0.20.0",
 #     "tensordict>=0.11.0",
 #     "torch>=2.10.0",
 #     "tqdm>=4.67.3",
@@ -49,6 +50,7 @@ Observation vector (obs_dim = N_LIDAR_OBS + 3 + 2 + N_LOOK*2):
 import argparse
 
 import numpy as np
+import rerun as rr
 import torch
 import torch.nn as nn
 import socketio
@@ -63,7 +65,13 @@ _parser.add_argument("--map", default="maps/my_map.yaml", help="path to map YAML
 _parser.add_argument(
     "--checkpoint", default="checkpoints/agent_final.pt", help="path to checkpoint"
 )
+_parser.add_argument(
+    "--rerun", action="store_true", help="stream debug data to a Rerun viewer"
+)
 _cli = _parser.parse_args()
+
+if _cli.rerun:
+    rr.init("rustoracer/autodrive_bridge", spawn=True)
 
 # ── Vehicle constants (from AutoDRIVE docs / sim) ──
 STEER_MAX = 0.5236  # rad (±30°)
@@ -107,6 +115,16 @@ _diffs = np.hypot(
 )
 LOOK_STEP = max(1, round(1.0 / float(_diffs.mean())))
 
+# LiDAR geometry constants (Hokuyo UST-10LX as used by AutoDRIVE: 270° FOV)
+LIDAR_IDX = np.round(np.linspace(0, N_LIDAR_RAW - 1, N_LIDAR_OBS)).astype(int)
+_LIDAR_FOV = np.deg2rad(270.0)
+_LIDAR_ANGLES_RAW = np.linspace(-_LIDAR_FOV / 2, _LIDAR_FOV / 2, N_LIDAR_RAW)
+_LIDAR_ANGLES_OBS = _LIDAR_ANGLES_RAW[LIDAR_IDX]  # angles for the 108 downsampled beams
+
+if _cli.rerun:
+    # Log the full centerline once as a static entity
+    rr.log("world/centerline", rr.LineStrips2D([_skeleton_pts]), static=True)
+
 
 def _yaw_from_quat(q: np.ndarray) -> float:
     """Extract yaw angle from a [qx, qy, qz, qw] quaternion."""
@@ -115,9 +133,9 @@ def _yaw_from_quat(q: np.ndarray) -> float:
 
 
 # ── Helpers ──
-LIDAR_IDX = np.round(np.linspace(0, N_LIDAR_RAW - 1, N_LIDAR_OBS)).astype(int)
 current_steer = 0.0  # tracked steering angle [rad] (for command integration)
 NOMINAL_DT = 1.0 / 60.0  # fixed dt for steering integration [s]
+_rr_step = 0  # Rerun frame counter
 
 
 def get_obs(f):
@@ -126,6 +144,10 @@ def get_obs(f):
     Includes downsampled lidar, vehicle states (speed, steering, yaw rate),
     and centerline features (heading diff, lateral offset, N_LOOK lookahead
     waypoints in the car's local frame) to match the sim training environment.
+
+    Returns:
+        obs_norm: normalized observation array fed to the model
+        debug:    dict of raw intermediate values for visualization
     """
     # ── LiDAR ──
     lidar = f.lidar_range_array[LIDAR_IDX]
@@ -166,7 +188,70 @@ def get_obs(f):
     obs = np.concatenate(
         [lidar, [vel, steer_rad, yaw_rate, heading_diff, lat_off], lookahead]
     )
-    return np.clip((obs - obs_mean) / np.sqrt(obs_var + 1e-8), -10, 10)
+    debug = dict(
+        lidar_raw=lidar.copy(),
+        x=float(x), y=float(y), theta=float(theta),
+        vel=float(vel), steer_rad=float(steer_rad), yaw_rate=float(yaw_rate),
+        heading_diff=float(heading_diff), lat_off=float(lat_off),
+        wi=wi, cx=float(cx), cy=float(cy),
+    )
+    return np.clip((obs - obs_mean) / np.sqrt(obs_var + 1e-8), -10, 10), debug
+
+
+def _log_rerun(dbg, d_steer_raw, torque_raw, torque_cmd, tracked_steer, steer_cmd):
+    """Stream one frame of debug data to the Rerun viewer."""
+    global _rr_step
+    rr.set_time_sequence("frame", _rr_step)
+    _rr_step += 1
+
+    x, y, theta = dbg["x"], dbg["y"], dbg["theta"]
+    lidar_raw = dbg["lidar_raw"]
+    wi, cx, cy = dbg["wi"], dbg["cx"], dbg["cy"]
+
+    # ── World-space geometry ──
+    rr.log("world/car", rr.Points2D([[x, y]], radii=[0.15], colors=[[43, 127, 255]]))
+    rr.log(
+        "world/heading",
+        rr.Arrows2D(
+            origins=[[x, y]],
+            vectors=[[0.5 * np.cos(theta), 0.5 * np.sin(theta)]],
+            colors=[[255, 255, 0]],
+        ),
+    )
+    rr.log("world/nearest_wp", rr.Points2D([[cx, cy]], radii=[0.1], colors=[[255, 165, 0]]))
+
+    lk_world = np.array(
+        [_skeleton_pts[(wi + (k + 1) * LOOK_STEP) % N_WPS] for k in range(N_LOOK)]
+    )
+    rr.log("world/lookahead", rr.Points2D(lk_world, radii=[0.08], colors=[[0, 255, 0]]))
+
+    # LiDAR rays in world frame (Hokuyo UST-10LX: 270° FOV centred on forward axis)
+    ray_ends = np.c_[
+        x + lidar_raw * np.cos(theta + _LIDAR_ANGLES_OBS),
+        y + lidar_raw * np.sin(theta + _LIDAR_ANGLES_OBS),
+    ]
+    origins = np.broadcast_to([[x, y]], ray_ends.shape).copy()
+    rr.log(
+        "world/lidar",
+        rr.LineStrips2D(np.stack([origins, ray_ends], axis=1), colors=[[255, 80, 80]]),
+    )
+
+    # ── Scalar observations ──
+    rr.log("obs/speed_mps", rr.Scalar(dbg["vel"]))
+    rr.log("obs/steer_rad", rr.Scalar(dbg["steer_rad"]))
+    rr.log("obs/yaw_rate_rads", rr.Scalar(dbg["yaw_rate"]))
+    rr.log("obs/heading_diff_rad", rr.Scalar(dbg["heading_diff"]))
+    rr.log("obs/lat_offset_m", rr.Scalar(dbg["lat_off"]))
+
+    # Raw LiDAR ranges as a bar chart (easy to spot clipping / short returns)
+    rr.log("obs/lidar_ranges", rr.BarChart(lidar_raw.astype(np.float32)))
+
+    # ── Model outputs and sent commands ──
+    rr.log("actions/d_steer_raw", rr.Scalar(d_steer_raw))
+    rr.log("actions/torque_raw", rr.Scalar(torque_raw))
+    rr.log("actions/tracked_steer_rad", rr.Scalar(tracked_steer))
+    rr.log("actions/steering_command", rr.Scalar(steer_cmd))
+    rr.log("actions/throttle_command", rr.Scalar(torque_cmd))
 
 
 # ── AutoDrive bridge ──
@@ -188,9 +273,10 @@ def bridge(sid, data):
         return
     f1.parse_data(data)
 
+    obs_norm, dbg = get_obs(f1)
     with torch.no_grad():
         act = agent(
-            torch.tensor(get_obs(f1), device=DEVICE, dtype=torch.float32).unsqueeze(0)
+            torch.tensor(obs_norm, device=DEVICE, dtype=torch.float32).unsqueeze(0)
         )
     a = act.cpu().numpy().flatten().clip(-1, 1)
 
@@ -206,6 +292,10 @@ def bridge(sid, data):
     # Send to AutoDRIVE: steering_command in [-1, 1], throttle_command in [-1, 1]
     f1.steering_command = current_steer / STEER_MAX  # normalize to [-1, 1]
     f1.throttle_command = torque
+
+    if _cli.rerun:
+        _log_rerun(dbg, d_steer, float(a[1]), torque, current_steer, f1.steering_command)
+
     try:
         sio.emit("Bridge", data=f1.generate_commands())
     except Exception as e:
