@@ -1,6 +1,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
+#     "rustoracerpy",
 #     "tensordict>=0.11.0",
 #     "torch>=2.10.0",
 #     "tqdm>=4.67.3",
@@ -13,12 +14,14 @@
 #     "itsdangerous==2.0.1",
 #     "jinja2==3.0.3",
 #     "numpy>=2.2.6",
-#     "opencv-contrib-python>=4.11.0.86",
 #     "pillow>=11.3.0",
 #     "python-engineio==3.13.0",
 #     "python-socketio==4.2.0",
 #     "werkzeug==2.0.3",
 # ]
+#
+# [tool.uv.sources]
+# rustoracerpy = { path = ".." }
 # ///
 """Rustoracer PPO agent → AutoDrive F1TENTH bridge.
 
