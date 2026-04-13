@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.10, <3.12"
 # dependencies = [
 #     "rustoracerpy",
 #     "rerun-sdk>=0.20.0",
@@ -8,16 +8,17 @@
 #     "tqdm>=4.67.3",
 #     "tyro>=1.0.8",
 #     "wandb[media]>=0.25.0",
-#     "eventlet>=0.40.0",
-#     "flask>=3.1.1",
-#     "flask-socketio>=5.5.1",
-#     "itsdangerous>=2.2.0",
-#     "jinja2>=3.1.6",
+#     "eventlet==0.33.3",
+#     "flask==1.1.1",
+#     "flask-socketio==4.1.0",
+#     "gevent-websocket==0.10.1",
+#     "itsdangerous==2.0.1",
+#     "jinja2==3.0.3",
 #     "numpy>=2.2.6",
 #     "pillow>=11.3.0",
-#     "python-engineio>=4.12.1",
-#     "python-socketio>=5.13.0",
-#     "werkzeug>=3.1.3",
+#     "python-engineio==3.13.0",
+#     "python-socketio==4.2.0",
+#     "werkzeug==2.0.3",
 # ]
 #
 # [tool.uv.sources]
@@ -200,7 +201,7 @@ def get_obs(f):
 def _log_rerun(dbg, d_steer_raw, torque_raw, torque_cmd, tracked_steer, steer_cmd):
     """Stream one frame of debug data to the Rerun viewer."""
     global _rr_step
-    rr.set_time_sequence("frame", _rr_step)
+    rr.set_time("frame", sequence=_rr_step)
     _rr_step += 1
 
     x, y, theta = dbg["x"], dbg["y"], dbg["theta"]
@@ -302,5 +303,5 @@ def bridge(sid, data):
 
 
 if __name__ == "__main__":
-    app = socketio.WSGIApp(sio, app)
+    app = socketio.Middleware(sio, app)
     eventlet.wsgi.server(eventlet.listen(("", 4567)), app)
