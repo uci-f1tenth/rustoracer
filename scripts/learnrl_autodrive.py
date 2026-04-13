@@ -45,10 +45,13 @@ Observation vector (obs_dim = N_LIDAR_OBS + 3 + 2 + N_LOOK*2):
 """
 
 import argparse
+import time
 
 import autodrive
 import eventlet
 import numpy as np
+import rerun as rr
+import rerun.blueprint as rrb
 import socketio
 import torch
 import torch.nn as nn
@@ -82,7 +85,11 @@ class Agent(nn.Module):
     def __init__(self, obs=OBS_DIM, act=2, h=256):
         super().__init__()
         self.actor_mean = nn.Sequential(
-            nn.Linear(obs, h), nn.Tanh(), nn.Linear(h, h), nn.Tanh(), nn.Linear(h, act)
+            nn.Linear(obs, h),
+            nn.Tanh(),
+            nn.Linear(h, h),
+            nn.Tanh(),
+            nn.Linear(h, act),
         )
 
     def forward(self, x):
@@ -123,9 +130,8 @@ NOMINAL_DT = 1.0 / 60.0  # fixed dt for steering integration [s]
 def get_obs(f):
     """Build the OBS_DIM-d observation vector.
 
-    Includes downsampled lidar, vehicle states (speed, steering, yaw rate),
-    and centerline features (heading diff, lateral offset, N_LOOK lookahead
-    waypoints in the car's local frame) to match the sim training environment.
+    Returns (obs_normalized, debug_dict) where debug_dict contains all raw
+    intermediate values for Rerun logging.
     """
     # ── LiDAR ──
     lidar = f.lidar_range_array[LIDAR_IDX]
@@ -151,14 +157,16 @@ def get_obs(f):
     # Heading difference (wrapped to [-π, π])
     heading_diff = ((cth - theta) + np.pi) % (2.0 * np.pi) - np.pi
 
-    # Signed lateral offset: project the vector from the centerline point to the car
-    # onto the centerline's left-normal direction (perpendicular, rotated 90° CCW).
+    # Signed lateral offset
     lat_off = -(x - cx) * np.sin(cth) + (y - cy) * np.cos(cth)
 
     # ── Lookahead waypoints in car frame ──
     lookahead = np.empty(N_LOOK * 2)
+    lookahead_world = np.empty((N_LOOK, 2))
     for k in range(N_LOOK):
-        wx, wy = _skeleton_pts[(wi + (k + 1) * LOOK_STEP) % N_WPS]
+        wp_idx = (wi + (k + 1) * LOOK_STEP) % N_WPS
+        wx, wy = _skeleton_pts[wp_idx]
+        lookahead_world[k] = [wx, wy]
         dx, dy = wx - x, wy - y
         lookahead[k * 2] = dx * ch + dy * sh
         lookahead[k * 2 + 1] = -dx * sh + dy * ch
@@ -166,8 +174,113 @@ def get_obs(f):
     obs = np.concatenate(
         [lidar, [vel, steer_rad, yaw_rate, heading_diff, lat_off], lookahead]
     )
-    return np.clip((obs - obs_mean) / np.sqrt(obs_var + 1e-8), -10, 10)
+    obs_norm = np.clip((obs - obs_mean) / np.sqrt(obs_var + 1e-8), -10, 10)
 
+    debug = dict(
+        lidar=lidar,
+        vel=vel,
+        steer_rad=steer_rad,
+        autodrive_steering_raw=f.steering,
+        yaw_rate=yaw_rate,
+        x=x,
+        y=y,
+        theta=theta,
+        nearest_wp_idx=wi,
+        centerline_heading=cth,
+        heading_diff=heading_diff,
+        lat_off=lat_off,
+        lookahead_world=lookahead_world,
+        lookahead_local=lookahead.reshape(-1, 2),
+        obs_raw=obs,
+        obs_norm=obs_norm,
+    )
+    return obs_norm, debug
+
+
+# ── Rerun init ──
+rr.init("autodrive_debug", spawn=True)
+
+# ── Rerun blueprint ──
+rr.send_blueprint(
+    rrb.Blueprint(
+        rrb.Horizontal(
+            rrb.Vertical(
+                rrb.Spatial2DView(
+                    name="Map / Trajectory",
+                    origin="/world",
+                    visual_bounds=rrb.VisualBounds2D(
+                        x_range=[-5, 25],
+                        y_range=[-5, 25],
+                    ),
+                ),
+                rrb.Spatial2DView(
+                    name="Car Frame (LiDAR + Lookahead)",
+                    origin="/car_frame",
+                ),
+                row_shares=[2, 1],
+            ),
+            rrb.Vertical(
+                rrb.TimeSeriesView(
+                    name="Agent Raw Outputs",
+                    origin="/agent",
+                ),
+                rrb.TimeSeriesView(
+                    name="Steering Pipeline",
+                    origin="/steering",
+                ),
+                rrb.TimeSeriesView(
+                    name="Commands Sent",
+                    origin="/commands",
+                ),
+                rrb.TimeSeriesView(
+                    name="Centerline Features",
+                    origin="/centerline",
+                ),
+                rrb.TimeSeriesView(
+                    name="Vehicle State",
+                    origin="/vehicle",
+                ),
+            ),
+            rrb.Vertical(
+                rrb.TimeSeriesView(
+                    name="Obs: LiDAR (normalized)",
+                    origin="/obs/lidar_norm",
+                ),
+                rrb.BarChartView(
+                    name="Obs Vector Snapshot",
+                    origin="/obs/full_vector",
+                ),
+            ),
+            column_shares=[2, 2, 1],
+        )
+    )
+)
+
+# ── Log static skeleton / centerline (once) ──
+skeleton_3d = np.hstack([_skeleton_pts, np.zeros((N_WPS, 1))])  # add z=0
+# Close the loop
+skeleton_closed = np.vstack([skeleton_3d, skeleton_3d[:1]])
+rr.log(
+    "world/centerline",
+    rr.LineStrips2D(
+        [_skeleton_pts.tolist() + [_skeleton_pts[0].tolist()]],
+        colors=[[80, 80, 80]],
+    ),
+    static=True,
+)
+rr.log(
+    "world/centerline_pts",
+    rr.Points2D(_skeleton_pts[::LOOK_STEP], colors=[[50, 50, 50]], radii=0.03),
+    static=True,
+)
+
+print(f"[rerun] OBS_DIM={OBS_DIM}, N_WPS={N_WPS}, LOOK_STEP={LOOK_STEP}")
+print(f"[rerun] obs_mean range: [{obs_mean.min():.3f}, {obs_mean.max():.3f}]")
+print(f"[rerun] obs_var  range: [{obs_var.min():.6f}, {obs_var.max():.6f}]")
+
+# ── Track timing ──
+_frame_count = 0
+_prev_time = None
 
 # ── AutoDrive bridge ──
 f1 = autodrive.RoboRacer()
@@ -183,16 +296,30 @@ def connect(sid, environ):
 
 @sio.on("Bridge")
 def bridge(sid, data):
-    global current_steer
+    global current_steer, _frame_count, _prev_time
     if not data:
         return
     f1.parse_data(data)
 
+    # ── Measure real dt ──
+    now = time.monotonic()
+    real_dt = (now - _prev_time) if _prev_time is not None else NOMINAL_DT
+    _prev_time = now
+
+    # ── Set Rerun time ──
+    rr.set_time("frame", sequence=_frame_count)
+    rr.set_time("wall_clock", timestamp=time.time())
+    _frame_count += 1
+
+    # ── Build observation ──
+    obs_norm, dbg = get_obs(f1)
+
     with torch.no_grad():
         act = agent(
-            torch.tensor(get_obs(f1), device=DEVICE, dtype=torch.float32).unsqueeze(0)
+            torch.tensor(obs_norm, device=DEVICE, dtype=torch.float32).unsqueeze(0)
         )
-    a = act.cpu().numpy().flatten().clip(-1, 1)
+    a_raw = act.cpu().numpy().flatten()
+    a = a_raw.clip(-1, 1)
 
     # a[0] = d_steer ∈ [-1, 1] → steering velocity
     # a[1] = torque   ∈ [-1, 1] → throttle command
@@ -201,11 +328,125 @@ def bridge(sid, data):
 
     # Integrate steering velocity with a fixed dt (matches sim's fixed-rate control)
     sv = d_steer * STEER_VEL_MAX  # rad/s
+    steer_before = current_steer
     current_steer = np.clip(current_steer + sv * NOMINAL_DT, -STEER_MAX, STEER_MAX)
 
     # Send to AutoDRIVE: steering_command in [-1, 1], throttle_command in [-1, 1]
     f1.steering_command = current_steer / STEER_MAX  # normalize to [-1, 1]
     f1.throttle_command = torque
+
+    # ══════════════════════════════════════════════════════════════════
+    #  RERUN LOGGING
+    # ══════════════════════════════════════════════════════════════════
+
+    # ── 1. Agent raw outputs (before any processing) ──
+    rr.log("agent/d_steer_raw", rr.Scalars(float(a_raw[0])))
+    rr.log("agent/torque_raw", rr.Scalars(float(a_raw[1])))
+    rr.log("agent/d_steer_clipped", rr.Scalars(d_steer))
+    rr.log("agent/torque_clipped", rr.Scalars(float(a[1])))
+
+    # ── 2. Steering pipeline: trace every step of the integration ──
+    rr.log("steering/steer_vel_rad_s", rr.Scalars(sv))
+    rr.log("steering/steer_before_integrate", rr.Scalars(steer_before))
+    rr.log("steering/steer_after_integrate", rr.Scalars(current_steer))
+    rr.log("steering/steer_delta_this_frame", rr.Scalars(current_steer - steer_before))
+    rr.log("steering/nominal_dt", rr.Scalars(NOMINAL_DT))
+    rr.log("steering/real_dt", rr.Scalars(real_dt))
+
+    # ── 3. Final commands sent to AutoDRIVE ──
+    rr.log("commands/steering_cmd", rr.Scalars(float(f1.steering_command)))
+    rr.log("commands/throttle_cmd", rr.Scalars(float(f1.throttle_command)))
+
+    # ── 4. Centerline features (are they reasonable?) ──
+    rr.log("centerline/heading_diff_rad", rr.Scalars(dbg["heading_diff"]))
+    rr.log("centerline/heading_diff_deg", rr.Scalars(np.degrees(dbg["heading_diff"])))
+    rr.log("centerline/lateral_offset_m", rr.Scalars(dbg["lat_off"]))
+    rr.log("centerline/nearest_wp_idx", rr.Scalars(dbg["nearest_wp_idx"]))
+
+    # ── 5. Vehicle state from AutoDRIVE ──
+    rr.log("vehicle/speed_m_s", rr.Scalars(dbg["vel"]))
+    rr.log("vehicle/autodrive_steering_raw", rr.Scalars(dbg["autodrive_steering_raw"]))
+    rr.log("vehicle/steer_rad", rr.Scalars(dbg["steer_rad"]))
+    rr.log("vehicle/yaw_rate", rr.Scalars(dbg["yaw_rate"]))
+    rr.log("vehicle/yaw_deg", rr.Scalars(np.degrees(dbg["theta"])))
+
+    # ── 6. Map view: car position + trajectory + lookahead ──
+    rr.log(
+        "world/car",
+        rr.Points2D([[dbg["x"], dbg["y"]]], colors=[[255, 60, 60]], radii=0.12),
+    )
+    # Car heading arrow
+    arrow_len = 0.5
+    rr.log(
+        "world/car_heading",
+        rr.Arrows2D(
+            origins=[[dbg["x"], dbg["y"]]],
+            vectors=[
+                [
+                    arrow_len * np.cos(dbg["theta"]),
+                    arrow_len * np.sin(dbg["theta"]),
+                ]
+            ],
+            colors=[[255, 60, 60]],
+        ),
+    )
+    # Nearest centerline point
+    ncx, ncy = _skeleton_pts[dbg["nearest_wp_idx"]]
+    rr.log(
+        "world/nearest_wp",
+        rr.Points2D([[ncx, ncy]], colors=[[0, 255, 0]], radii=0.1),
+    )
+    # Lookahead waypoints (world frame)
+    rr.log(
+        "world/lookahead",
+        rr.Points2D(dbg["lookahead_world"], colors=[[255, 200, 0]], radii=0.06),
+    )
+    rr.log(
+        "world/lookahead_line",
+        rr.LineStrips2D(
+            [np.vstack([[dbg["x"], dbg["y"]], dbg["lookahead_world"]])],
+            colors=[[255, 200, 0, 100]],
+        ),
+    )
+
+    # ── 7. Car-frame view: LiDAR fan + lookahead ──
+    lidar_ranges = dbg["lidar"]
+    lidar_angles = np.linspace(-np.pi * 0.75, np.pi * 0.75, N_LIDAR_OBS)
+    lidar_x = lidar_ranges * np.cos(lidar_angles)
+    lidar_y = lidar_ranges * np.sin(lidar_angles)
+    rr.log(
+        "car_frame/lidar",
+        rr.Points2D(
+            np.stack([lidar_x, lidar_y], axis=-1),
+            colors=[[0, 180, 255]],
+            radii=0.02,
+        ),
+    )
+    rr.log(
+        "car_frame/lookahead",
+        rr.Points2D(dbg["lookahead_local"], colors=[[255, 200, 0]], radii=0.08),
+    )
+    rr.log(
+        "car_frame/origin",
+        rr.Points2D([[0, 0]], colors=[[255, 60, 60]], radii=0.08),
+    )
+
+    # ── 8. Observation sanity checks ──
+    # Log a few representative normalized lidar beams (front, left, right)
+    front_idx = N_LIDAR_OBS // 2
+    rr.log("obs/lidar_norm/front", rr.Scalars(float(obs_norm[front_idx])))
+    rr.log("obs/lidar_norm/left", rr.Scalars(float(obs_norm[0])))
+    rr.log("obs/lidar_norm/right", rr.Scalars(float(obs_norm[N_LIDAR_OBS - 1])))
+
+    # Raw vs normalized for key features
+    rr.log("obs/lidar_norm/raw_front_m", rr.Scalars(float(dbg["obs_raw"][front_idx])))
+
+    # Snapshot of the full normalized obs as a bar chart (every 10th frame)
+    if _frame_count % 10 == 0:
+        rr.log("obs/full_vector", rr.BarChart(obs_norm))
+
+    # ══════════════════════════════════════════════════════════════════
+
     try:
         sio.emit("Bridge", data=f1.generate_commands())
     except Exception as e:
