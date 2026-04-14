@@ -8,13 +8,15 @@ parallelises all N environments natively.
 
 CPU:
 ```bash
-uv run --with "jax[cpu]" --with optax --with scipy --with scikit-image \
+uv run --with "jax[cpu]" --with optax --with "wandb[media]" --with av \
+       --with scipy --with scikit-image \
        --with pillow --with pyyaml --with tqdm --with tyro \
        scripts/learnrl_jax.py
 ```
 GPU (CUDA 12):
 ```bash
-uv run --with "jax[cuda12]" --with optax --with scipy --with scikit-image \
+uv run --with "jax[cuda12]" --with optax --with "wandb[media]" --with av \
+       --with scipy --with scikit-image \
        --with pillow --with pyyaml --with tqdm --with tyro \
        scripts/learnrl_jax.py
 ```

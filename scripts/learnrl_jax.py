@@ -4,7 +4,7 @@ lax.scan compiles the T-step rollout; vmap parallelises N envs on-device.
 State: [x, y, δ, v, ψ] — one RK4 step at 60 Hz.
 
 Usage:
-    uv run --with "jax[cpu]" --with optax --with av --with wandb \\
+    uv run --with "jax[cpu]" --with optax --with "wandb[media]" --with av \\
            --with scipy --with scikit-image --with pillow \\
            --with pyyaml --with tqdm --with tyro scripts/learnrl_jax.py
 """
@@ -51,8 +51,8 @@ class Args:
     scan_steps: int = 30
     track: bool = False
     """Enable wandb logging."""
-    capture_video: bool = True
-    """Record top-down eval video and upload to wandb."""
+    capture_video: bool = False
+    """Record top-down eval video and upload to wandb (requires --track)."""
     video_interval: int = 25
     """Record a video every N iterations (0 = disabled)."""
     video_max_steps: int = 3_600
@@ -172,7 +172,8 @@ class MapData:
         self.inv_res      = np.float32(1./res)
         self.ox, self.oy  = np.float32(ox), np.float32(oy)
         self.n_wps        = len(skel)
-        self.look_step    = max(1, round(1./np.linalg.norm(skel[1:]-skel[:-1], axis=1).mean()))
+        seg_len = np.linalg.norm(skel[1:]-skel[:-1], axis=1).mean()
+        self.look_step    = max(1, round(1./seg_len)) if seg_len > 0 else 1
         self.obs_dim      = N_BEAMS + 3 + 2 + N_LOOK * 2   # lidar + [v,δ,ψ̇] + [he,le] + look
 
 
@@ -462,7 +463,7 @@ def record_eval_video(params: dict, map_data: MapData, args: Args):
 
 def main():
     args = tyro.cli(Args)
-    B, num_iters = args.num_envs * args.num_steps, 0
+    B        = args.num_envs * args.num_steps
     num_iters = args.total_timesteps // B
     os.makedirs(args.save_dir, exist_ok=True)
 
