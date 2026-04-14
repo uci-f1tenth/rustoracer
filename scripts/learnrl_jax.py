@@ -562,7 +562,7 @@ def main():
         dones_np = np.array(dones_t)  # T × N  (1.0 = episode ended)
         for t in range(args.num_steps):
             ep_rew_acc += rews_np[t]
-            for i in np.where(dones_np[t] > 0.5)[0]:
+            for i in np.where(dones_np[t] >= 0.5)[0]:
                 ep_rews.append(float(ep_rew_acc[i]))
                 ep_rew_acc[i] = 0.
 
