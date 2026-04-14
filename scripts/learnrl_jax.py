@@ -1,7 +1,7 @@
-"""learnrl_jax.py — F1tenth PPO · pure JAX · kinematic bicycle model.
+"""learnrl_jax.py — F1tenth PPO · pure JAX · dynamic bicycle model.
 
 lax.scan compiles the T-step rollout; vmap parallelises N envs on-device.
-State: [x, y, δ, v, ψ] — one RK4 step at 60 Hz.
+State: [x, y, δ, v_x, v_y, ψ, ψ̇] — linearised Pacejka tires, one RK4 step at 60 Hz.
 
 Usage:
     uv run --with "jax[cpu]" --with optax --with "wandb[media]" --with av \\
@@ -66,15 +66,26 @@ class Args:
 STEER_MIN, STEER_MAX = np.float32(-0.5236), np.float32(0.5236)
 STEER_VEL_MAX        = np.float32(3.2)
 V_MIN, V_MAX         = np.float32(-5.0), np.float32(20.0)
+DPSI_MAX             = np.float32(10.0)      # yaw-rate clip (rad/s)
 WIDTH, LENGTH        = np.float32(0.27), np.float32(0.50)
 DRAG                 = np.float32(0.5 * 0.3 * 0.04 * 1.225)  # ½ρCdA
+G                    = np.float32(9.81)
 PI, DT               = np.float32(np.pi), np.float32(1. / 60.)
 N_BEAMS, N_LOOK      = 108, 10
 FOV                  = np.float32(270. * np.pi / 180.)
 MIN_RANGE, MAX_RANGE = np.float32(0.06), np.float32(10.0)
-P_DEF = {k: np.float32(v) for k, v in
-         {"lf": 0.15532, "lr": 0.16868, "mass": 3.906, "a_max": 9.51}.items()}
-RAND_KEYS = tuple(P_DEF)
+# Dynamic bicycle model parameters (F1tenth gym defaults)
+P_DEF = {k: np.float32(v) for k, v in {
+    "lf":   0.15875,   # front axle distance from CG  (m)
+    "lr":   0.17145,   # rear axle distance from CG   (m)
+    "m":    3.74,      # mass                          (kg)
+    "I_z":  0.04712,   # yaw moment of inertia         (kg·m²)
+    "mu":   0.523,     # tyre–road friction coefficient
+    "C_Sf": 4.718,     # front cornering stiffness factor
+    "C_Sr": 5.4562,    # rear cornering stiffness factor
+    "a_max": 9.51,     # max longitudinal acceleration (m/s²)
+}.items()}
+RAND_KEYS = ("lf", "lr", "m", "a_max")  # parameters to randomise
 
 
 # ── Map preprocessing ──────────────────────────────────────────────────────────
@@ -177,15 +188,36 @@ class MapData:
         self.obs_dim      = N_BEAMS + 3 + 2 + N_LOOK * 2   # lidar + [v,δ,ψ̇] + [he,le] + look
 
 
-# ── Kinematic bicycle dynamics ─────────────────────────────────────────────────
-# State s = [x, y, δ, v, ψ]
+# ── Dynamic bicycle model ──────────────────────────────────────────────────────
+# State s = [x, y, δ, v_x, v_y, ψ, ψ̇]
 
-def _kin_dyn(s, accel, sv, p):
-    x, y, delta, v, psi = s
-    lwb = p["lf"] + p["lr"]
-    return jnp.array([v*jnp.cos(psi), v*jnp.sin(psi), sv,
-                      accel - DRAG*v*jnp.abs(v)/p["mass"],
-                      v/lwb*jnp.tan(delta)])
+def _dyn(s, accel, sv, p):
+    """Single-track dynamic bicycle model with linearised Pacejka tyre forces."""
+    x, y, delta, vx, vy, psi, dpsi = s
+    lwb    = p["lf"] + p["lr"]
+    safe_vx = jnp.maximum(jnp.abs(vx), jnp.float32(0.05))  # guard against divide-by-zero
+
+    # Slip angles (sign convention: positive = toe-out)
+    alpha_f = jnp.arctan2(dpsi * p["lf"] + vy, safe_vx) - delta
+    alpha_r = jnp.arctan2(dpsi * p["lr"] - vy, safe_vx)
+
+    # Lateral tyre forces (linearised Pacejka, weight-distributed)
+    mg      = p["m"] * G
+    F_yf    = -p["mu"] * mg * (p["lr"] / lwb) * p["C_Sf"] * alpha_f
+    F_yr    = -p["mu"] * mg * (p["lf"] / lwb) * p["C_Sr"] * alpha_r
+
+    # Longitudinal force + aero drag on vx
+    F_x     = p["m"] * accel - DRAG * vx * jnp.abs(vx)
+
+    return jnp.array([
+        vx * jnp.cos(psi) - vy * jnp.sin(psi),                             # ẋ
+        vx * jnp.sin(psi) + vy * jnp.cos(psi),                             # ẏ
+        sv,                                                                   # δ̇
+        (F_x - F_yf * jnp.sin(delta) + p["m"] * vy * dpsi) / p["m"],      # v̇_x
+        (F_yr + F_yf * jnp.cos(delta) - p["m"] * vx * dpsi) / p["m"],     # v̇_y
+        dpsi,                                                                 # ψ̇
+        (F_yf * p["lf"] * jnp.cos(delta) - F_yr * p["lr"]) / p["I_z"],   # ψ̈
+    ])
 
 
 # ── Simulation ─────────────────────────────────────────────────────────────────
@@ -216,9 +248,8 @@ def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
         return (~jnp.isfinite(x)) | (~jnp.isfinite(y)) | (d < COLR)
 
     def _obs(s, wi, p):
-        x, y, delta, v, psi = s
+        x, y, delta, vx, vy, psi, dpsi = s
         sh, ch = jnp.sin(psi), jnp.cos(psi)
-        lwb = p["lf"] + p["lr"]
         # Lidar: EDT sphere-tracing, all N_BEAMS rays in parallel via lax.scan
         sa, ca  = bsc[:,0], bsc[:,1]
         bdx, bdy = ch*ca - sh*sa, sh*ca + ch*sa
@@ -249,17 +280,22 @@ def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
         idx  = (wi + jnp.arange(1,N_LOOK+1,dtype=jnp.int32)*look_step) % n_wps
         dxy  = skel[idx] - jnp.array([x, y])
         look = jnp.stack([dxy[:,0]*ch+dxy[:,1]*sh, -dxy[:,0]*sh+dxy[:,1]*ch], 1).ravel()
-        return jnp.concatenate([scans, jnp.array([v, delta, v/lwb*jnp.tan(delta)]),
+        return jnp.concatenate([scans, jnp.array([vx, delta, dpsi]),
                                   jnp.array([he, le]), look])
 
     def _reset(rng):
         rng, sub = jax.random.split(rng)
         ri  = jax.random.randint(jax.random.fold_in(sub, jnp.uint32(0)), (), 0, n_wps)
         pt, ptn = skel[ri], skel[(ri+1)%n_wps]
-        p = {k: P_DEF[k] * (1. + jnp.float32(dr_frac) *
-             (jax.random.uniform(jax.random.fold_in(sub, jnp.uint32(i+1)))*2.-1.))
-             for i, k in enumerate(RAND_KEYS)}
-        s = jnp.array([pt[0], pt[1], 0., 0., jnp.arctan2(ptn[1]-pt[1], ptn[0]-pt[0])])
+        # Start from defaults; randomise only RAND_KEYS
+        p = {k: P_DEF[k] for k in P_DEF}
+        for i, k in enumerate(RAND_KEYS):
+            u    = jax.random.uniform(jax.random.fold_in(sub, jnp.uint32(i+1)))
+            p[k] = P_DEF[k] * (1. + jnp.float32(dr_frac) * (u * 2. - 1.))
+        th = jnp.arctan2(ptn[1]-pt[1], ptn[0]-pt[0])
+        # 7-state: [x, y, δ, v_x, v_y, ψ, ψ̇]
+        s = jnp.array([pt[0], pt[1], jnp.float32(0.), jnp.float32(0.),
+                        jnp.float32(0.), th, jnp.float32(0.)])
         return s, ri, p, rng
 
     def _step(state, action):
@@ -268,12 +304,16 @@ def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
         sv    = jnp.where((sv<0.)&(s[2]<=STEER_MIN), 0., sv)
         sv    = jnp.where((sv>0.)&(s[2]>=STEER_MAX), 0., sv)
         accel = jnp.clip(action[1], -1., 1.) * p["a_max"]
-        f  = lambda s: _kin_dyn(s, accel, sv, p)
+        f  = lambda s: _dyn(s, accel, sv, p)
         k1 = f(s); k2 = f(s+k1*(dt_f/2)); k3 = f(s+k2*(dt_f/2)); k4 = f(s+k3*dt_f)
         s  = s + dt_f/6. * (k1 + 2.*k2 + 2.*k3 + k4)
-        x, y, delta, v, psi = s
-        s  = jnp.array([x, y, jnp.clip(delta,STEER_MIN,STEER_MAX),
-                         jnp.clip(v,V_MIN,V_MAX), (psi+PI)%(2.*PI)-PI])
+        x, y, delta, vx, vy, psi, dpsi = s
+        s  = jnp.array([x, y,
+                         jnp.clip(delta, STEER_MIN, STEER_MAX),
+                         jnp.clip(vx, V_MIN, V_MAX),
+                         jnp.clip(vy, -V_MAX, V_MAX),
+                         (psi+PI)%(2.*PI)-PI,
+                         jnp.clip(dpsi, -DPSI_MAX, DPSI_MAX)])
         px, py  = _to_px(x, y)
         new_wi  = lut[py*W + px]
         d_wp    = jnp.float32(new_wi - wi)
@@ -281,7 +321,7 @@ def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
         d_wp    = jnp.where(d_wp < -jnp.float32(n_wps)/2., d_wp + jnp.float32(n_wps), d_wp)
         term    = _collides(s)
         trunc   = (steps + jnp.int32(1)) >= jnp.int32(max_steps)
-        reward  = (d_wp/jnp.float32(n_wps)*100.*(1.+jnp.maximum(v,0.)/10.)
+        reward  = (d_wp/jnp.float32(n_wps)*100.*(1.+jnp.maximum(vx,0.)/10.)
                    - 0.1*jnp.exp(-3.*edt[py,px])
                    - jnp.where(term, 100., 0.))
         rs, rwi, rp, rng = _reset(rng)
@@ -414,7 +454,8 @@ def _render_frame(map_data: MapData, dyn: np.ndarray) -> np.ndarray:
     """Top-down RGB frame: map background + car rectangle."""
     img  = Image.fromarray(map_data.img_rgb.copy())
     draw = ImageDraw.Draw(img)
-    x, y, _, _, psi = dyn
+    x, y = float(dyn[0]), float(dyn[1])
+    psi  = float(dyn[5])  # ψ is state[5] in 7-state model
     px   = float((x - map_data.ox) * map_data.inv_res)
     py   = float((map_data.h - 1) - (y - map_data.oy) * map_data.inv_res)
     cp, sp = float(np.cos(psi)), float(np.sin(psi))
@@ -496,8 +537,9 @@ def main():
                    if args.capture_video and args.video_interval > 0 else set())
 
     print("Compiling first iteration…")
-    ep_rews: list[float] = []
-    sps_buf: list[float] = []
+    ep_rews:    list[float] = []
+    ep_rew_acc: np.ndarray  = np.zeros(args.num_envs, dtype=np.float64)
+    sps_buf:    list[float] = []
     global_step = 0
 
     for it in tqdm.trange(1, num_iters + 1):
@@ -512,9 +554,17 @@ def main():
         jax.block_until_ready(loss)
 
         sps = B / (time.time() - t_it);  sps_buf.append(sps);  global_step += B
-        _, rews, dones, *_ = traj
-        ep_rews.extend(float(r) for r, d in
-                       zip(rews.ravel().tolist(), dones.ravel().tolist()) if d)
+
+        # Accumulate proper per-episode returns from the trajectory.
+        # traj = (obs, act, rew, done, lp, val) — T×N each.
+        obs_t, act_t, rews_t, dones_t, lp_t, val_t = traj
+        rews_np  = np.array(rews_t)   # T × N
+        dones_np = np.array(dones_t)  # T × N  (1.0 = episode ended)
+        for t in range(args.num_steps):
+            ep_rew_acc += rews_np[t]
+            for i in np.where(dones_np[t] > 0.5)[0]:
+                ep_rews.append(float(ep_rew_acc[i]))
+                ep_rew_acc[i] = 0.
 
         mean_rew = float(np.mean(ep_rews[-500:])) if ep_rews else float("nan")
         lr_now   = float(sched(opt_state[1][1].count))
