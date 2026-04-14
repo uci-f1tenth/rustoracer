@@ -76,9 +76,11 @@ class Args:
     save_interval: int = 50
     save_dir: str = "checkpoints"
     dyn_substeps: int = 4
-    """Physics RK4 substeps per control step (reduce for speed, increase for accuracy)."""
-    scan_steps: int = 50
-    """Fixed raycast march iterations (EDT sphere-tracing; 50 is safe for typical maps)."""
+    """Physics substeps per control step."""
+    scan_steps: int = 30
+    """Fixed raycast march iterations (EDT sphere-tracing; 30 is safe for typical maps)."""
+    integrator: str = "euler"
+    """Integration scheme: 'euler' (fastest), 'midpoint' (2× evals/substep), or 'rk4' (4× evals/substep)."""
 
 
 # ── Physics constants (f32) ────────────────────────────────────────────────────
@@ -430,6 +432,15 @@ def _std_dynamics(s, torque, sv, p):
     ])
 
 
+def _euler(s, dt, f):
+    return s + dt * f(s)
+
+
+def _midpoint(s, dt, f):
+    k1 = f(s)
+    return s + dt * f(s + (dt / 2) * k1)
+
+
 def _rk4(s, dt, f):
     k1 = f(s)
     k2 = f(s + k1 * (dt / 2))
@@ -449,7 +460,8 @@ def _steering_constraint(steer, sv):
 
 
 def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
-                 dt: float = 1. / 60., substeps: int = 4, scan_steps: int = N_SCAN_STEPS):
+                 dt: float = 1. / 60., substeps: int = 4, scan_steps: int = 30,
+                 integrator: str = "euler"):
     """Return JIT-compiled batched environment functions.
 
     Returns:
@@ -468,6 +480,7 @@ def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
     look_step = jnp.int32(map_data.look_step)
     sub_dt = jnp.float32(dt / substeps)
     Wf, Hf = jnp.float32(W), jnp.float32(H)
+    _integrate = {"euler": _euler, "midpoint": _midpoint, "rk4": _rk4}[integrator]
 
     def _pos_to_px(x, y):
         px = jnp.int32(jnp.clip((x - ox) * inv_res, 0., Wf - 1.))
@@ -549,20 +562,23 @@ def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
                                  jnp.array([heading_err, lat_err]), look_local])
 
     def _random_state(rng):
-        rng, k1, k2 = jax.random.split(rng, 3)
-        ri = jax.random.randint(k1, (), 0, n_wps)
+        # Advance rng with a single split; use fold_in for all derived draws
+        # so we never allocate a batch of 13+ keys via split.
+        rng_new = jax.random.split(rng)[0]
+        ri = jax.random.randint(
+            jax.random.fold_in(rng, jnp.uint32(0)), (), 0, n_wps)
         pt = skeleton[ri]
         pt_next = skeleton[(ri + 1) % n_wps]
         th = jnp.arctan2(pt_next[1] - pt[1], pt_next[0] - pt[0])
 
-        pkeys = jax.random.split(k2, len(RAND_KEYS))
         p = dict(P_DEF)
         for i, k in enumerate(RAND_KEYS):
-            scale = 1. + jnp.float32(dr_frac) * (jax.random.uniform(pkeys[i]) * 2. - 1.)
+            u = jax.random.uniform(jax.random.fold_in(rng, jnp.uint32(i + 1)))
+            scale = 1. + jnp.float32(dr_frac) * (u * 2. - 1.)
             p[k] = P_DEF[k] * scale
 
         dyn = jnp.array([pt[0], pt[1], 0., 0., th, 0., 0., 0., 0.])
-        return dyn, ri, p, rng
+        return dyn, ri, p, rng_new
 
     def _single_step(state, action):
         dyn, wp_idx, steps, rng, p = (
@@ -575,7 +591,7 @@ def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
         torque = torque_n * p["mass"] * p["a_max"] * p["r_w"]
 
         def substep(d, _):
-            return _rk4(d, sub_dt, lambda s: _std_dynamics(s, torque, sv, p)), None
+            return _integrate(d, sub_dt, lambda s: _std_dynamics(s, torque, sv, p)), None
 
         dyn_new, _ = lax.scan(substep, dyn, None, length=substeps)
 
@@ -703,13 +719,16 @@ def make_ppo_fns(batched_step, batched_obs, optimizer, args: Args):
     @jax.jit
     def collect_rollout(params, state, rng):
         """T × N steps compiled into one XLA program via lax.scan."""
+        env_ids = jnp.arange(N, dtype=jnp.uint32)
+
         def step_fn(carry, _):
             state, rng = carry
             obs = state["obs"]                                    # (N, obs_dim) — free
             rng, key = jax.random.split(rng)
-            keys = jax.random.split(key, N)
+            # fold_in is O(1) per env and avoids allocating N separate keys
             action, lp, value = jax.vmap(
-                lambda o, k: _policy_forward(params, o, k))(obs, keys)
+                lambda o, i: _policy_forward(params, o, jax.random.fold_in(key, i))
+            )(obs, env_ids)
             new_state, (rew, term, trunc) = batched_step(state, action)
             # new_state["obs"] already computed inside batched_step
             done = (term | trunc).astype(jnp.float32)
@@ -813,7 +832,8 @@ def main():
 
     batched_step, batched_obs, batched_init = make_sim_fns(
         map_data, args.max_steps, args.dr_frac,
-        substeps=args.dyn_substeps, scan_steps=args.scan_steps)
+        substeps=args.dyn_substeps, scan_steps=args.scan_steps,
+        integrator=args.integrator)
 
     rng = jax.random.PRNGKey(args.seed)
     rng, init_key, policy_key = jax.random.split(rng, 3)
