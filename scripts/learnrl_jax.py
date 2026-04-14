@@ -103,10 +103,6 @@ FOV = np.float32(270.0 * np.pi / 180.0)
 MIN_RANGE = np.float32(0.06)
 MAX_RANGE = np.float32(10.0)
 N_LOOK = 10
-# Fixed iteration count for the batched raycast scan.
-# EDT sphere-tracing converges in <10 steps for typical track geometry; 50 is
-# a safe upper bound that XLA can unroll into one fused kernel.
-N_SCAN_STEPS = 50
 
 # Default car parameters
 _P_DICT = dict(
