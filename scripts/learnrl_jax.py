@@ -86,8 +86,8 @@ MAX_RANGE = np.float32(10.0)
 N_LOOK   = 10
 
 # Kinematic bicycle model parameters
-P_DEF: dict[str, np.float32] = {k: np.float32(v) for k, v in dict(
-    lf=0.15532, lr=0.16868, mass=3.906, a_max=9.51).items()}
+P_DEF: dict[str, np.float32] = {k: np.float32(v) for k, v in {
+    "lf": 0.15532, "lr": 0.16868, "mass": 3.906, "a_max": 9.51}.items()}
 RAND_KEYS = ("lf", "lr", "mass", "a_max")
 
 
@@ -145,7 +145,7 @@ class MapData:
         self.oy       = np.float32(oy)
         self.n_wps    = int(len(smoothed))
         self.look_step = int(look_step)
-        self.obs_dim  = N_BEAMS + 3 + 2 + N_LOOK * 2
+        self.obs_dim  = N_BEAMS + 3 + 2 + N_LOOK * 2  # lidar(108) + [v,δ,ψ̇](3) + [heading,lat](2) + lookahead(20)
 
 
 def _nbrs8(p: tuple, pts: set) -> list:
@@ -265,7 +265,7 @@ def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
     look_step = jnp.int32(map_data.look_step)
     dt_f     = jnp.float32(dt)
     Wf, Hf   = jnp.float32(W), jnp.float32(H)
-    R_COL    = jnp.float32(np.sqrt((LENGTH / 2.) ** 2 + (WIDTH / 2.) ** 2))
+    CIRCUMRADIUS = jnp.float32(np.sqrt((LENGTH / 2.) ** 2 + (WIDTH / 2.) ** 2))
 
     def _collides(dyn):
         x, y = dyn[0], dyn[1]
@@ -276,7 +276,7 @@ def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
         pxi = jnp.int32(jnp.clip(px_f, 0., Wf - 1.))
         pyi = jnp.int32(jnp.clip(py_f, 0., Hf - 1.))
         edt_val = jnp.where(in_map, edt[pyi, pxi], 0.)
-        return not_finite | (edt_val < R_COL)
+        return not_finite | (edt_val < CIRCUMRADIUS)
 
     def _compute_obs(dyn, wp_idx, p):
         x, y, delta, v, psi = dyn
