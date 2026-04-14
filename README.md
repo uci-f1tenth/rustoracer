@@ -1,5 +1,25 @@
 # Install instructions
-### learnrl.py 
+
+### learnrl_jax.py (pure JAX — fastest)
+Single-file rewrite using JAX + Optax + scipy/skimage.  Everything — physics,
+environment, and PPO training — runs as one compiled XLA program on the GPU.
+Zero CPU↔GPU copies per step; `lax.scan` compiles the full rollout loop; `vmap`
+parallelises all N environments natively.
+
+CPU:
+```bash
+uv run --with "jax[cpu]" --with optax --with scipy --with scikit-image \
+       --with pillow --with pyyaml --with tqdm --with tyro \
+       scripts/learnrl_jax.py
+```
+GPU (CUDA 12):
+```bash
+uv run --with "jax[cuda12]" --with optax --with scipy --with scikit-image \
+       --with pillow --with pyyaml --with tqdm --with tyro \
+       scripts/learnrl_jax.py
+```
+
+### learnrl.py (Rust sim + PyTorch)
 ```bash
 uv run --with torch --with tensordict --with tqdm --with tyro --with wandb[media] --with av scripts/learnrl.py
 ```
