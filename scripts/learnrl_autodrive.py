@@ -23,25 +23,13 @@
 # ///
 """Rustoracer PPO agent → AutoDrive F1TENTH bridge.
 
-The trained model outputs [d_steer, torque] both in [-1, 1]:
-  - d_steer: normalized steering velocity (±1 → ±3.2 rad/s)
-  - torque:  normalized drive torque (±1 → full brake/throttle)
-
-AutoDRIVE accepts:
-  - steering_command in [-1, 1] → maps to [-0.5236, 0.5236] rad (±30°)
-  - throttle_command in [-1, 1] → maps to full reverse/forward torque
-
-We integrate d_steer into a tracked steering angle (matching the sim)
-and send it as a normalized steering command.
-
-Observation vector (obs_dim = N_LIDAR_OBS + 3 + 2 + N_LOOK*2):
-  [0:N_LIDAR_OBS]               downsampled lidar ranges
-  [N_LIDAR_OBS]                 speed (m/s)
-  [N_LIDAR_OBS+1]               steering angle (rad)
-  [N_LIDAR_OBS+2]               yaw rate (rad/s)
-  [N_LIDAR_OBS+3]               heading difference to centerline (rad)
-  [N_LIDAR_OBS+4]               lateral offset from centerline (m)
-  [N_LIDAR_OBS+5 : obs_dim]     N_LOOK lookahead waypoints in car frame (dx, dy each)
+FIXES applied (relative to original):
+  1. map_frame: world in slam_toolbox config — skeleton is now in world frame
+  2. Steering integration uses real_dt (clamped) instead of fixed 1/60
+  3. Steering state synced to actual AutoDRIVE feedback each frame
+  4. Torque scaling removed (configurable via --throttle-scale)
+  5. Speed clamped to physical limits (vehicle top speed 22.88 m/s)
+  6. Frame-alignment diagnostics logged to Rerun
 """
 
 import argparse
@@ -64,20 +52,27 @@ _parser.add_argument("--map", default="maps/my_map.yaml", help="path to map YAML
 _parser.add_argument(
     "--checkpoint", default="checkpoints/agent_final.pt", help="path to checkpoint"
 )
+_parser.add_argument(
+    "--throttle-scale",
+    type=float,
+    default=1.0,
+    help="multiplier for throttle command (1.0 = full, 0.5 = half power)",
+)
 _cli = _parser.parse_args()
 
-# ── Vehicle constants (from AutoDRIVE docs / sim) ──
+# ── Vehicle constants (from AutoDRIVE technical guide) ──
 STEER_MAX = 0.5236  # rad (±30°)
-STEER_VEL_MAX = 3.2  # rad/s  (steering rate limit)
+STEER_VEL_MAX = 3.2  # rad/s (steering actuator rate)
+SPEED_MAX = 22.88  # m/s (vehicle top speed per technical guide)
 N_LIDAR_RAW = 1080  # AutoDRIVE LIDAR measurements per scan
 N_LIDAR_OBS = 108  # downsampled beams to match sim training
-N_LOOK = 10  # lookahead waypoints (must match training; see sim.rs N_LOOK)
+N_LOOK = 10  # lookahead waypoints (must match training)
 
 # ── Load checkpoint ──
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ckpt = torch.load(_cli.checkpoint, map_location=DEVICE, weights_only=False)
 obs_mean, obs_var = ckpt["obs_rms_mean"].numpy(), ckpt["obs_rms_var"].numpy()
-OBS_DIM = obs_mean.shape[0]  # inferred from checkpoint (133 for centerline model)
+OBS_DIM = obs_mean.shape[0]
 
 
 # ── Agent (must match training architecture) ──
@@ -100,11 +95,9 @@ agent = Agent()
 agent.load_state_dict(ckpt["model"], strict=False)
 agent.to(DEVICE).eval()
 
-# ── Centerline setup (mirrors sim.rs skeleton / look_step logic) ──
-_sim = PySim(
-    _cli.map, 1, 1
-)  # num_envs=1, max_steps=1 — only used to extract the skeleton
-_skeleton_pts: np.ndarray = _sim.skeleton.reshape(-1, 2)  # (N, 2) world coords
+# ── Centerline setup ──
+_sim = PySim(_cli.map, 1, 1)
+_skeleton_pts: np.ndarray = _sim.skeleton.reshape(-1, 2)
 del _sim
 
 N_WPS = len(_skeleton_pts)
@@ -115,33 +108,34 @@ _diffs = np.hypot(
 LOOK_STEP = max(1, round(1.0 / float(_diffs.mean())))
 
 
+# ── Helpers ──
+
+
 def _yaw_from_quat(q: np.ndarray) -> float:
-    """Extract yaw angle from a [qx, qy, qz, qw] quaternion."""
+    """Extract yaw from [qx, qy, qz, qw] quaternion (AutoDRIVE convention)."""
     qx, qy, qz, qw = q
     return float(np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)))
 
 
-# ── Helpers ──
 LIDAR_IDX = np.round(np.linspace(0, N_LIDAR_RAW - 1, N_LIDAR_OBS)).astype(int)
-current_steer = 0.0  # tracked steering angle [rad] (for command integration)
-NOMINAL_DT = 1.0 / 60.0  # fixed dt for steering integration [s]
+
+# Tracked steering angle [rad] — synced to AutoDRIVE feedback each frame
+current_steer = 0.0
 
 
 def get_obs(f):
-    """Build the OBS_DIM-d observation vector.
+    """Build the OBS_DIM-d observation vector from AutoDRIVE data."""
 
-    Returns (obs_normalized, debug_dict) where debug_dict contains all raw
-    intermediate values for Rerun logging.
-    """
-    # ── LiDAR ──
+    # ── LiDAR (downsample 1080 → 108) ──
     lidar = f.lidar_range_array[LIDAR_IDX]
 
     # ── Vehicle states ──
-    vel = f.speed
-    steer_rad = f.steering * STEER_MAX
-    yaw_rate = f.angular_velocity[2]
+    # Clamp speed to physical limits; protects against physics explosions
+    vel = float(np.clip(f.speed, -SPEED_MAX, SPEED_MAX))
+    steer_rad = f.steering * STEER_MAX  # sensor output [-1,1] → radians
+    yaw_rate = f.angular_velocity[2]  # z-axis = yaw (z-up frame)
 
-    # ── Car pose ──
+    # ── Car pose (IPS is in world frame; with map_frame:world they now match) ──
     x, y = f.position[0], f.position[1]
     theta = _yaw_from_quat(f.orientation_quaternion)
     ch, sh = np.cos(theta), np.sin(theta)
@@ -149,16 +143,19 @@ def get_obs(f):
     # ── Nearest centerline waypoint ──
     wi = int(np.argmin(np.hypot(_skeleton_pts[:, 0] - x, _skeleton_pts[:, 1] - y)))
 
+    # Distance to nearest waypoint (for diagnostics)
+    ncx, ncy = _skeleton_pts[wi]
+    dist_to_wp = np.hypot(x - ncx, y - ncy)
+
     # Centerline heading at wi
-    cx, cy = _skeleton_pts[wi]
     nx, ny = _skeleton_pts[(wi + 1) % N_WPS]
-    cth = np.arctan2(ny - cy, nx - cx)
+    cth = np.arctan2(ny - ncy, nx - ncx)
 
     # Heading difference (wrapped to [-π, π])
     heading_diff = ((cth - theta) + np.pi) % (2.0 * np.pi) - np.pi
 
     # Signed lateral offset
-    lat_off = -(x - cx) * np.sin(cth) + (y - cy) * np.cos(cth)
+    lat_off = -(x - ncx) * np.sin(cth) + (y - ncy) * np.cos(cth)
 
     # ── Lookahead waypoints in car frame ──
     lookahead = np.empty(N_LOOK * 2)
@@ -186,6 +183,7 @@ def get_obs(f):
         y=y,
         theta=theta,
         nearest_wp_idx=wi,
+        dist_to_wp=dist_to_wp,
         centerline_heading=cth,
         heading_diff=heading_diff,
         lat_off=lat_off,
@@ -200,7 +198,6 @@ def get_obs(f):
 # ── Rerun init ──
 rr.init("autodrive_debug", spawn=True)
 
-# ── Rerun blueprint ──
 rr.send_blueprint(
     rrb.Blueprint(
         rrb.Horizontal(
@@ -243,6 +240,10 @@ rr.send_blueprint(
             ),
             rrb.Vertical(
                 rrb.TimeSeriesView(
+                    name="Frame Alignment",
+                    origin="/alignment",
+                ),
+                rrb.TimeSeriesView(
                     name="Obs: LiDAR (normalized)",
                     origin="/obs/lidar_norm",
                 ),
@@ -256,10 +257,7 @@ rr.send_blueprint(
     )
 )
 
-# ── Log static skeleton / centerline (once) ──
-skeleton_3d = np.hstack([_skeleton_pts, np.zeros((N_WPS, 1))])  # add z=0
-# Close the loop
-skeleton_closed = np.vstack([skeleton_3d, skeleton_3d[:1]])
+# ── Log static skeleton (once) ──
 rr.log(
     "world/centerline",
     rr.LineStrips2D(
@@ -274,11 +272,12 @@ rr.log(
     static=True,
 )
 
-print(f"[rerun] OBS_DIM={OBS_DIM}, N_WPS={N_WPS}, LOOK_STEP={LOOK_STEP}")
-print(f"[rerun] obs_mean range: [{obs_mean.min():.3f}, {obs_mean.max():.3f}]")
-print(f"[rerun] obs_var  range: [{obs_var.min():.6f}, {obs_var.max():.6f}]")
+print(f"[bridge] OBS_DIM={OBS_DIM}, N_WPS={N_WPS}, LOOK_STEP={LOOK_STEP}")
+print(f"[bridge] throttle_scale={_cli.throttle_scale}")
+print(f"[bridge] obs_mean range: [{obs_mean.min():.3f}, {obs_mean.max():.3f}]")
+print(f"[bridge] obs_var  range: [{obs_var.min():.6f}, {obs_var.max():.6f}]")
 
-# ── Track timing ──
+# ── Timing state ──
 _frame_count = 0
 _prev_time = None
 
@@ -301,9 +300,12 @@ def bridge(sid, data):
         return
     f1.parse_data(data)
 
-    # ── Measure real dt ──
+    # ── Measure real dt (clamped to avoid spikes) ──
     now = time.monotonic()
-    real_dt = (now - _prev_time) if _prev_time is not None else NOMINAL_DT
+    if _prev_time is not None:
+        real_dt = np.clip(now - _prev_time, 1e-4, 0.1)  # clamp to [0.1ms, 100ms]
+    else:
+        real_dt = 1.0 / 60.0  # first frame: assume 60 Hz
     _prev_time = now
 
     # ── Set Rerun time ──
@@ -321,61 +323,71 @@ def bridge(sid, data):
     a_raw = act.cpu().numpy().flatten()
     a = a_raw.clip(-1, 1)
 
-    # a[0] = d_steer ∈ [-1, 1] → steering velocity
-    # a[1] = torque   ∈ [-1, 1] → throttle command
-    d_steer = float(a[0])
-    torque = float(a[1]) * 0.03
+    d_steer = float(a[0])  # normalized steering velocity ∈ [-1, 1]
+    throttle = float(a[1])  # normalized torque ∈ [-1, 1]
 
-    # Integrate steering velocity with a fixed dt (matches sim's fixed-rate control)
+    # ── FIX 3: Sync steering state to actual AutoDRIVE feedback ──
+    # This ensures we always integrate from the real steering angle,
+    # matching how the Rust sim works (observation reflects actual state).
+    current_steer = f1.steering * STEER_MAX
+
+    # ── FIX 2: Integrate steering velocity using real_dt ──
     sv = d_steer * STEER_VEL_MAX  # rad/s
     steer_before = current_steer
-    current_steer = np.clip(current_steer + sv * NOMINAL_DT, -STEER_MAX, STEER_MAX)
+    current_steer = np.clip(current_steer + sv * real_dt, -STEER_MAX, STEER_MAX)
 
-    # Send to AutoDRIVE: steering_command in [-1, 1], throttle_command in [-1, 1]
+    # ── Send commands to AutoDRIVE ──
     f1.steering_command = current_steer / STEER_MAX  # normalize to [-1, 1]
-    f1.throttle_command = torque
+    f1.throttle_command = throttle * _cli.throttle_scale  # FIX 4: configurable scale
 
     # ══════════════════════════════════════════════════════════════════
     #  RERUN LOGGING
     # ══════════════════════════════════════════════════════════════════
 
-    # ── 1. Agent raw outputs (before any processing) ──
+    # ── 1. Agent raw outputs ──
     rr.log("agent/d_steer_raw", rr.Scalars(float(a_raw[0])))
     rr.log("agent/torque_raw", rr.Scalars(float(a_raw[1])))
     rr.log("agent/d_steer_clipped", rr.Scalars(d_steer))
-    rr.log("agent/torque_clipped", rr.Scalars(float(a[1])))
+    rr.log("agent/torque_clipped", rr.Scalars(throttle))
 
-    # ── 2. Steering pipeline: trace every step of the integration ──
+    # ── 2. Steering pipeline ──
     rr.log("steering/steer_vel_rad_s", rr.Scalars(sv))
     rr.log("steering/steer_before_integrate", rr.Scalars(steer_before))
     rr.log("steering/steer_after_integrate", rr.Scalars(current_steer))
     rr.log("steering/steer_delta_this_frame", rr.Scalars(current_steer - steer_before))
-    rr.log("steering/nominal_dt", rr.Scalars(NOMINAL_DT))
     rr.log("steering/real_dt", rr.Scalars(real_dt))
 
     # ── 3. Final commands sent to AutoDRIVE ──
     rr.log("commands/steering_cmd", rr.Scalars(float(f1.steering_command)))
     rr.log("commands/throttle_cmd", rr.Scalars(float(f1.throttle_command)))
 
-    # ── 4. Centerline features (are they reasonable?) ──
+    # ── 4. Centerline features ──
     rr.log("centerline/heading_diff_rad", rr.Scalars(dbg["heading_diff"]))
     rr.log("centerline/heading_diff_deg", rr.Scalars(np.degrees(dbg["heading_diff"])))
     rr.log("centerline/lateral_offset_m", rr.Scalars(dbg["lat_off"]))
-    rr.log("centerline/nearest_wp_idx", rr.Scalars(dbg["nearest_wp_idx"]))
 
-    # ── 5. Vehicle state from AutoDRIVE ──
+    # ── 5. Frame alignment diagnostics (NEW) ──
+    rr.log("alignment/dist_to_nearest_wp_m", rr.Scalars(dbg["dist_to_wp"]))
+    rr.log("alignment/nearest_wp_idx", rr.Scalars(dbg["nearest_wp_idx"]))
+    rr.log("alignment/car_x", rr.Scalars(dbg["x"]))
+    rr.log("alignment/car_y", rr.Scalars(dbg["y"]))
+    rr.log("alignment/yaw_deg", rr.Scalars(np.degrees(dbg["theta"])))
+    rr.log(
+        "alignment/centerline_heading_deg",
+        rr.Scalars(np.degrees(dbg["centerline_heading"])),
+    )
+
+    # ── 6. Vehicle state ──
     rr.log("vehicle/speed_m_s", rr.Scalars(dbg["vel"]))
     rr.log("vehicle/autodrive_steering_raw", rr.Scalars(dbg["autodrive_steering_raw"]))
     rr.log("vehicle/steer_rad", rr.Scalars(dbg["steer_rad"]))
     rr.log("vehicle/yaw_rate", rr.Scalars(dbg["yaw_rate"]))
-    rr.log("vehicle/yaw_deg", rr.Scalars(np.degrees(dbg["theta"])))
 
-    # ── 6. Map view: car position + trajectory + lookahead ──
+    # ── 7. Map view ──
     rr.log(
         "world/car",
         rr.Points2D([[dbg["x"], dbg["y"]]], colors=[[255, 60, 60]], radii=0.12),
     )
-    # Car heading arrow
     arrow_len = 0.5
     rr.log(
         "world/car_heading",
@@ -390,13 +402,11 @@ def bridge(sid, data):
             colors=[[255, 60, 60]],
         ),
     )
-    # Nearest centerline point
     ncx, ncy = _skeleton_pts[dbg["nearest_wp_idx"]]
     rr.log(
         "world/nearest_wp",
         rr.Points2D([[ncx, ncy]], colors=[[0, 255, 0]], radii=0.1),
     )
-    # Lookahead waypoints (world frame)
     rr.log(
         "world/lookahead",
         rr.Points2D(dbg["lookahead_world"], colors=[[255, 200, 0]], radii=0.06),
@@ -409,7 +419,7 @@ def bridge(sid, data):
         ),
     )
 
-    # ── 7. Car-frame view: LiDAR fan + lookahead ──
+    # ── 8. Car-frame view ──
     lidar_ranges = dbg["lidar"]
     lidar_angles = np.linspace(-np.pi * 0.75, np.pi * 0.75, N_LIDAR_OBS)
     lidar_x = lidar_ranges * np.cos(lidar_angles)
@@ -431,17 +441,13 @@ def bridge(sid, data):
         rr.Points2D([[0, 0]], colors=[[255, 60, 60]], radii=0.08),
     )
 
-    # ── 8. Observation sanity checks ──
-    # Log a few representative normalized lidar beams (front, left, right)
+    # ── 9. Observation checks ──
     front_idx = N_LIDAR_OBS // 2
     rr.log("obs/lidar_norm/front", rr.Scalars(float(obs_norm[front_idx])))
     rr.log("obs/lidar_norm/left", rr.Scalars(float(obs_norm[0])))
     rr.log("obs/lidar_norm/right", rr.Scalars(float(obs_norm[N_LIDAR_OBS - 1])))
-
-    # Raw vs normalized for key features
     rr.log("obs/lidar_norm/raw_front_m", rr.Scalars(float(dbg["obs_raw"][front_idx])))
 
-    # Snapshot of the full normalized obs as a bar chart (every 10th frame)
     if _frame_count % 10 == 0:
         rr.log("obs/full_vector", rr.BarChart(obs_norm))
 
