@@ -31,7 +31,8 @@ class Args:
     yaml: str = "maps/my_map.yaml"
     exp_name: str = "learnrl_jax"
     seed: int = 42
-    num_envs: int = 1024
+    num_envs: int = 0
+    """Parallel environments (0 = auto-detect: 1024 on GPU/TPU, 256 on CPU)."""
     num_steps: int = 128
     total_timesteps: int = 200_000_000
     learning_rate: float = 3e-4
@@ -197,9 +198,9 @@ def _dyn(s, accel, sv, p):
     lwb    = p["lf"] + p["lr"]
     safe_vx = jnp.maximum(jnp.abs(vx), jnp.float32(0.05))  # guard against divide-by-zero
 
-    # Slip angles (sign convention: positive = toe-out)
-    alpha_f = jnp.arctan2(dpsi * p["lf"] + vy, safe_vx) - delta
-    alpha_r = jnp.arctan2(dpsi * p["lr"] - vy, safe_vx)
+    # Slip angles — arctan is sufficient since safe_vx > 0 (no quadrant ambiguity)
+    alpha_f = jnp.arctan((dpsi * p["lf"] + vy) / safe_vx) - delta
+    alpha_r = jnp.arctan((dpsi * p["lr"] - vy) / safe_vx)
 
     # Lateral tyre forces (linearised Pacejka, weight-distributed)
     mg      = p["m"] * G
@@ -504,6 +505,8 @@ def record_eval_video(params: dict, map_data: MapData, args: Args):
 
 def main():
     args = tyro.cli(Args)
+    if args.num_envs <= 0:
+        args.num_envs = 256 if jax.default_backend() == "cpu" else 1024
     B        = args.num_envs * args.num_steps
     num_iters = args.total_timesteps // B
     os.makedirs(args.save_dir, exist_ok=True)
@@ -536,7 +539,7 @@ def main():
     video_iters = (set(range(1, num_iters+1, args.video_interval)) | {num_iters}
                    if args.capture_video and args.video_interval > 0 else set())
 
-    print("Compiling first iteration…")
+    print("Compiling first iteration… (may take 1–5 min on CPU)")
     ep_rews:    list[float] = []
     ep_rew_acc: np.ndarray  = np.zeros(args.num_envs, dtype=np.float64)
     sps_buf:    list[float] = []
