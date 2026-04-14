@@ -480,7 +480,11 @@ def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
     look_step = jnp.int32(map_data.look_step)
     sub_dt = jnp.float32(dt / substeps)
     Wf, Hf = jnp.float32(W), jnp.float32(H)
-    _integrate = {"euler": _euler, "midpoint": _midpoint, "rk4": _rk4}[integrator]
+    _INTEGRATORS = {"euler": _euler, "midpoint": _midpoint, "rk4": _rk4}
+    if integrator not in _INTEGRATORS:
+        raise ValueError(
+            f"Unknown integrator {integrator!r}. Choose from: {list(_INTEGRATORS)}")
+    _integrate = _INTEGRATORS[integrator]
 
     def _pos_to_px(x, y):
         px = jnp.int32(jnp.clip((x - ox) * inv_res, 0., Wf - 1.))
@@ -562,18 +566,18 @@ def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
                                  jnp.array([heading_err, lat_err]), look_local])
 
     def _random_state(rng):
-        # Advance rng with a single split; use fold_in for all derived draws
-        # so we never allocate a batch of 13+ keys via split.
-        rng_new = jax.random.split(rng)[0]
+        # Use fold_in for all derived draws to avoid allocating a batch of 13+ keys.
+        # Advance the rng state with a split so consecutive steps stay independent.
+        rng_new, rng_draw = jax.random.split(rng)
         ri = jax.random.randint(
-            jax.random.fold_in(rng, jnp.uint32(0)), (), 0, n_wps)
+            jax.random.fold_in(rng_draw, jnp.uint32(0)), (), 0, n_wps)
         pt = skeleton[ri]
         pt_next = skeleton[(ri + 1) % n_wps]
         th = jnp.arctan2(pt_next[1] - pt[1], pt_next[0] - pt[0])
 
         p = dict(P_DEF)
         for i, k in enumerate(RAND_KEYS):
-            u = jax.random.uniform(jax.random.fold_in(rng, jnp.uint32(i + 1)))
+            u = jax.random.uniform(jax.random.fold_in(rng_draw, jnp.uint32(i + 1)))
             scale = 1. + jnp.float32(dr_frac) * (u * 2. - 1.)
             p[k] = P_DEF[k] * scale
 
