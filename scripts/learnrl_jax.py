@@ -75,6 +75,10 @@ class Args:
     """Domain-randomisation fraction (±fraction of default param values)."""
     save_interval: int = 50
     save_dir: str = "checkpoints"
+    dyn_substeps: int = 4
+    """Physics RK4 substeps per control step (reduce for speed, increase for accuracy)."""
+    scan_steps: int = 50
+    """Fixed raycast march iterations (EDT sphere-tracing; 50 is safe for typical maps)."""
 
 
 # ── Physics constants (f32) ────────────────────────────────────────────────────
@@ -99,6 +103,10 @@ FOV = np.float32(270.0 * np.pi / 180.0)
 MIN_RANGE = np.float32(0.06)
 MAX_RANGE = np.float32(10.0)
 N_LOOK = 10
+# Fixed iteration count for the batched raycast scan.
+# EDT sphere-tracing converges in <10 steps for typical track geometry; 50 is
+# a safe upper bound that XLA can unroll into one fused kernel.
+N_SCAN_STEPS = 50
 
 # Default car parameters
 _P_DICT = dict(
@@ -445,7 +453,7 @@ def _steering_constraint(steer, sv):
 
 
 def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
-                 dt: float = 1. / 60., substeps: int = 6):
+                 dt: float = 1. / 60., substeps: int = 4, scan_steps: int = N_SCAN_STEPS):
     """Return JIT-compiled batched environment functions.
 
     Returns:
@@ -494,43 +502,41 @@ def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
         any_col = jnp.any(edt[cys, cxs] < res)
         return not_finite | jnp.where(no_col, jnp.bool_(False), any_col)
 
-    def _raycast(lx, ly, bdx, bdy):
-        """EDT sphere-tracing for one ray via lax.while_loop."""
+    def _compute_obs(dyn, wp_idx, p):
+        x, y, delta, v, psi, psi_dot, *_ = dyn
+        sh, ch = jnp.sin(psi), jnp.cos(psi)
+        lx, ly = x + p["lf"] * ch, y + p["lf"] * sh
+
+        # Batched raycast: all N_BEAMS rays marched simultaneously for
+        # `scan_steps` fixed iterations — no while_loop, fully vectorised.
+        sa = beam_sc[:, 0]              # (N_BEAMS,)
+        ca = beam_sc[:, 1]
+        bdx = ch * ca - sh * sa         # (N_BEAMS,)  world-frame direction x
+        bdy = sh * ca + ch * sa         # (N_BEAMS,)  world-frame direction y
         px0 = (lx - ox) * inv_res
         py0 = (Hf - 1.) - (ly - oy) * inv_res
-        dpx, dpy = bdx * inv_res, -bdy * inv_res
+        dpx = bdx * inv_res             # (N_BEAMS,)
+        dpy = -bdy * inv_res            # (N_BEAMS,)
+        min_step = jnp.float32(res * 0.5)
 
-        def cond(carry):
-            t, _result, done = carry
-            return ~done & (t < MAX_RANGE)
-
-        def body(carry):
-            t, result, done = carry
+        def ray_step(carry, _):
+            t, result, done = carry    # all (N_BEAMS,)
             pxf = px0 + t * dpx
             pyf = py0 + t * dpy
             ib = (pxf >= 0.) & (pxf < Wf) & (pyf >= 0.) & (pyf < Hf)
             pxi = jnp.int32(jnp.clip(pxf, 0., Wf - 1.))
             pyi = jnp.int32(jnp.clip(pyf, 0., Hf - 1.))
             d = jnp.where(ib, edt[pyi, pxi], 0.)
-            hit = ~ib | (d < res * 0.5)
-            new_t = t + jnp.maximum(d, res * 0.5)
+            hit = (~done) & (~ib | (d < min_step))
             new_result = jnp.where(hit, t, result)
-            return new_t, new_result, done | hit
+            new_done = done | hit
+            new_t = jnp.where(new_done, t, t + jnp.maximum(d, min_step))
+            return (new_t, new_result, new_done), None
 
-        _, result, _ = lax.while_loop(
-            cond, body, (MIN_RANGE, jnp.float32(MAX_RANGE), jnp.bool_(False)))
-        return result
-
-    def _compute_obs(dyn, wp_idx, p):
-        x, y, delta, v, psi, psi_dot, *_ = dyn
-        sh, ch = jnp.sin(psi), jnp.cos(psi)
-        lx, ly = x + p["lf"] * ch, y + p["lf"] * sh
-
-        def cast(sc):
-            sa, ca = sc
-            return _raycast(lx, ly, ch * ca - sh * sa, sh * ca + ch * sa)
-
-        scans = jax.vmap(cast)(beam_sc)    # (N_BEAMS,)
+        t0 = jnp.full(N_BEAMS, MIN_RANGE)
+        r0 = jnp.full(N_BEAMS, MAX_RANGE)
+        d0 = jnp.zeros(N_BEAMS, dtype=jnp.bool_)
+        (_, scans, _), _ = lax.scan(ray_step, (t0, r0, d0), None, length=scan_steps)
 
         wp_pt = skeleton[wp_idx]
         wp_next = skeleton[(wp_idx + 1) % n_wps]
@@ -607,7 +613,8 @@ def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
         final_p = jax.tree.map(lambda a, b: jnp.where(done, a, b), reset_p, p)
 
         new_state = {"dyn": final_dyn, "wp_idx": final_wi,
-                     "steps": final_steps, "rng": new_rng, "p": final_p}
+                     "steps": final_steps, "rng": new_rng, "p": final_p,
+                     "obs": _compute_obs(final_dyn, final_wi, final_p)}
         return new_state, (reward, terminated, truncated)
 
     def _single_obs(state):
@@ -615,7 +622,8 @@ def make_sim_fns(map_data: MapData, max_steps: int, dr_frac: float,
 
     def _init_single(rng):
         dyn, ri, p, rng = _random_state(rng)
-        return {"dyn": dyn, "wp_idx": ri, "steps": jnp.int32(0), "rng": rng, "p": p}
+        return {"dyn": dyn, "wp_idx": ri, "steps": jnp.int32(0), "rng": rng, "p": p,
+                "obs": _compute_obs(dyn, ri, p)}
 
     batched_step = jax.jit(jax.vmap(_single_step))
     batched_obs  = jax.jit(jax.vmap(_single_obs))
@@ -701,12 +709,13 @@ def make_ppo_fns(batched_step, batched_obs, optimizer, args: Args):
         """T × N steps compiled into one XLA program via lax.scan."""
         def step_fn(carry, _):
             state, rng = carry
-            obs = batched_obs(state)                          # (N, obs_dim)
+            obs = state["obs"]                                    # (N, obs_dim) — free
             rng, key = jax.random.split(rng)
             keys = jax.random.split(key, N)
             action, lp, value = jax.vmap(
                 lambda o, k: _policy_forward(params, o, k))(obs, keys)
             new_state, (rew, term, trunc) = batched_step(state, action)
+            # new_state["obs"] already computed inside batched_step
             done = (term | trunc).astype(jnp.float32)
             return (new_state, rng), (obs, action, rew, done, lp, value)
 
@@ -807,7 +816,8 @@ def main():
           f"  ({time.time()-t0:.1f}s)")
 
     batched_step, batched_obs, batched_init = make_sim_fns(
-        map_data, args.max_steps, args.dr_frac)
+        map_data, args.max_steps, args.dr_frac,
+        substeps=args.dyn_substeps, scan_steps=args.scan_steps)
 
     rng = jax.random.PRNGKey(args.seed)
     rng, init_key, policy_key = jax.random.split(rng, 3)
@@ -841,10 +851,9 @@ def main():
         state, rng, traj = collect_rollout(params, state, roll_key)
         jax.block_until_ready(traj)
 
-        # Bootstrap value for last step
-        last_obs = batched_obs(state)
+        # Bootstrap value for last step (obs already in state — no extra raycast)
         last_value = jax.vmap(
-            lambda o: _mlp(params["critic"], o).squeeze())(last_obs)
+            lambda o: _mlp(params["critic"], o).squeeze())(state["obs"])
 
         rng, upd_key = jax.random.split(rng)
         params, opt_state, rng, loss = update(
