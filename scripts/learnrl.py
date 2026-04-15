@@ -16,6 +16,7 @@ import tqdm
 import tyro
 from torch.distributions.normal import Normal
 
+import rerun as rr
 import wandb
 from rustoracerpy import RustoracerEnv
 
@@ -90,6 +91,11 @@ class Args:
     """max steps per evaluation video episode"""
     video_crf: int = 23
     """H.264 CRF quality (0=lossless, 51=worst; 18-28 is typical)"""
+
+    debug_interval: int = 0
+    """run a rerun debug-visualization episode every N iterations (0 to disable)"""
+    debug_episode_steps: int = 600
+    """max steps per debug-visualization episode"""
 
     save_interval: int = 50
     """save checkpoint every N iterations"""
@@ -301,6 +307,36 @@ def record_eval_video(
 
 
 # ─────────────────────────────────────────────────────────────
+# Debug visualization helper — runs one episode in a rerun-mode
+# env and logs each frame to the rerun viewer.
+# ─────────────────────────────────────────────────────────────
+@torch.no_grad()
+def run_debug_episode(
+    debug_env: RustoracerEnv,
+    agent: Agent,
+    obs_rms_cpu: CPURunningMeanStd,
+    device: torch.device,
+    update: int,
+    max_steps: int = 600,
+) -> float:
+    """Run one short episode, rendering every step to rerun for visual debugging."""
+    rr.set_time_sequence("iteration", update)
+    raw_obs, _ = debug_env.reset(seed=update)
+    total_reward = 0.0
+    for step in range(max_steps):
+        debug_env.render(step=step)
+        obs_norm = obs_rms_cpu.normalize(raw_obs)
+        obs_t = torch.tensor(obs_norm, device=device, dtype=torch.float32)
+        action_mean = agent.actor_mean(obs_t)
+        action_np = action_mean.cpu().numpy().astype(np.float64).clip(-1.0, 1.0)
+        raw_obs, reward, terminated, truncated, _ = debug_env.step(action_np)
+        total_reward += float(reward[0])
+        if terminated[0] or truncated[0]:
+            break
+    return total_reward
+
+
+# ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
 def gpu_rms_to_cpu(gpu_rms: GPURunningMeanStd) -> CPURunningMeanStd:
@@ -394,6 +430,7 @@ if __name__ == "__main__":
     )
     obs_dim: int = env.single_observation_space.shape[0]
     act_dim: int = env.single_action_space.shape[0]
+    n_beams: int = env._sim.n_beams
     print(f"obs={obs_dim}  act={act_dim}  envs={args.num_envs}")
 
     # ── network + optimiser ──────────────────────────────────────
@@ -440,6 +477,7 @@ if __name__ == "__main__":
     ep_len_cpu = np.zeros(args.num_envs, dtype=np.int64)
     recent_returns: deque[float] = deque(maxlen=200)
     recent_lengths: deque[int] = deque(maxlen=200)
+    recent_collisions: deque[bool] = deque(maxlen=200)
 
     # ── Reusable CPU buffer for clipped actions ──────────────────
     act_np_buf = np.empty((args.num_envs, act_dim), dtype=np.float64)
@@ -566,6 +604,17 @@ if __name__ == "__main__":
     else:
         video_iters = set()
 
+    # ── debug visualization schedule ─────────────────────────────
+    if args.debug_interval > 0:
+        debug_env = RustoracerEnv(
+            yaml=args.yaml, num_envs=1, max_steps=args.max_ep_steps, render_mode="human"
+        )
+        debug_iters = set(range(args.debug_interval, args.num_iterations + 1, args.debug_interval))
+        debug_iters.add(args.num_iterations)
+    else:
+        debug_env = None
+        debug_iters = set()
+
     pbar = tqdm.tqdm(range(1, args.num_iterations + 1))
 
     # ═══════════════════  outer loop  ════════════════════════════
@@ -625,12 +674,18 @@ if __name__ == "__main__":
             for i in done_idx:
                 recent_returns.append(float(ep_ret_cpu[i]))
                 recent_lengths.append(int(ep_len_cpu[i]))
+                recent_collisions.append(bool(terminated_np[i]))
                 ep_ret_cpu[i] = 0.0
                 ep_len_cpu[i] = 0
 
             # Update obs normaliser
             obs_rms.update(next_obs_raw)
             next_obs_n = obs_rms.normalize(next_obs_raw)
+
+        # ── debug rollout stats (computed while buffers are filled) ──
+        obs_velocity_t = obs_buf[:, :, n_beams].detach().mean()
+        action_steer_t = act_buf[:, :, 0].detach().mean()
+        action_vel_t = act_buf[:, :, 1].detach().mean()
 
         # ── GAE ──────────────────────────────────────────────────
         with torch.inference_mode():
@@ -683,13 +738,14 @@ if __name__ == "__main__":
         # ── single GPU→CPU sync for all metrics ─────────────────
         if num_updates > 0:
             inv = 1.0 / num_updates
-            metrics = (
-                torch.stack([sum_pg, sum_vl, sum_ent, sum_kl, sum_cf]).cpu().numpy()
-                * inv
-            )
-            pg_loss_val, v_loss_val, ent_loss_val, approx_kl_val, clipfrac_val = metrics
+            all_metrics = torch.stack(
+                [sum_pg, sum_vl, sum_ent, sum_kl, sum_cf, obs_velocity_t, action_steer_t, action_vel_t]
+            ).cpu().numpy()
+            pg_loss_val, v_loss_val, ent_loss_val, approx_kl_val, clipfrac_val = all_metrics[:5] * inv
+            obs_vel_mean, steer_act_mean, vel_act_mean = all_metrics[5:]
         else:
             pg_loss_val = v_loss_val = ent_loss_val = approx_kl_val = clipfrac_val = 0.0
+            obs_vel_mean = steer_act_mean = vel_act_mean = 0.0
 
         # ── logging ──────────────────────────────────────────────
         elapsed = time.time() - t0
@@ -708,6 +764,10 @@ if __name__ == "__main__":
             "losses/approx_kl": approx_kl_val,
             "losses/clipfrac": clipfrac_val,
             "debug/kl_early_stopped": int(kl_early_stopped),
+            "debug/collision_rate": float(np.mean(list(recent_collisions))) if recent_collisions else 0.0,
+            "debug/obs_velocity_mean": float(obs_vel_mean),
+            "debug/action_steer_mean": float(steer_act_mean),
+            "debug/action_vel_mean": float(vel_act_mean),
             "perf/global_step": global_step,
         }
 
@@ -732,6 +792,21 @@ if __name__ == "__main__":
             else:
                 print(f"[iter {update}] WARNING: no frames captured!")
             wandb.log(eval_log, step=global_step)
+
+        # ── debug visualization ───────────────────────────────────
+        if update in debug_iters and debug_env is not None:
+            print(f"\n[iter {update}] Running debug visualization...")
+            obs_rms_cpu_d = gpu_rms_to_cpu(obs_rms)
+            debug_reward = run_debug_episode(
+                debug_env=debug_env,
+                agent=agent,
+                obs_rms_cpu=obs_rms_cpu_d,
+                device=device,
+                update=update,
+                max_steps=args.debug_episode_steps,
+            )
+            wandb.log({"debug/viz_episode_return": debug_reward}, step=global_step)
+            print(f"[iter {update}] Debug viz done, return={debug_reward:.2f}")
 
         wandb.log(log_dict, step=global_step)
 
@@ -769,5 +844,7 @@ if __name__ == "__main__":
     print(f"\n✅  Training complete — {global_step:,} total steps in {total_time:.1f}s")
     print(f"Average speed: {global_step / total_time:,.0f} SPS")
 
+    if debug_env is not None:
+        debug_env.close()
     env.close()
     wandb.finish()

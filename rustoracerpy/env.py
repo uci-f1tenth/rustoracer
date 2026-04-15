@@ -68,8 +68,16 @@ class RustoracerEnv(gym.vector.VectorEnv):
             {"state": states.reshape(self.num_envs, -1)},
         )
 
-    def render(self):
+    def render(self, step: int | None = None):
+        """Render the current simulation state.
+
+        Args:
+            step: Optional step index used to set the rerun timeline sequence.
+                  When provided, frames are ordered correctly in the rerun viewer.
+        """
         if self.render_mode == "human":
+            if step is not None:
+                rr.set_time_sequence("step", step)
             rr.log("world/image", rr.Image(self._sim.render()))
             scans, _, _, _, state = self._sim.observe()
             sk_px = self._sim.world_to_pixels(self.skeleton).reshape(-1, 2)
